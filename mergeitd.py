@@ -509,6 +509,20 @@ class Mutation(object):
         return(f'{self.pos[0]}_{self.pos[1]}{self.mutType}{self.ins_str}')
 
     def nameActualMut(self, config):
+        if self.mutType.startswith("ins"):
+            boundary = self.pos[0]
+
+            if boundary <= 0 or boundary >= len(config["ANNO"]):
+                raise ValueError(
+                    f"Insertion boundary {boundary} cannot be represented "
+                    "with two flanking annotation bases"
+                )
+
+            pos0 = config["ANNO"].iloc[boundary - 1]["HGVScoord"]
+            pos1 = config["ANNO"].iloc[boundary]["HGVScoord"]
+
+            return f'c.{pos0}_{pos1}{self.mutType}{self.ins_str}'
+
         pos0 = config["ANNO"].iloc[self.pos[0]]["HGVScoord"]
         if self.mutType == "snp":
             return(f'c.{pos0}{self.ins_str}')
