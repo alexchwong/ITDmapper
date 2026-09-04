@@ -19,6 +19,7 @@ from typing import Iterable, Optional
 
 from Bio import Align, SeqIO
 
+from hgvs_normalize import normalize_mergeitd_name
 from itdmapper_settings import load_settings, validate_settings
 
 try:
@@ -156,6 +157,39 @@ class Flt3Reference:
 
     def genomic_pos_for_c(self, c_pos: int) -> int:
         return self.genomic_pos_for_index(self.index_by_c[c_pos])
+
+    def hgvs_coord_for_index(self, idx: int) -> str:
+        """Return c.-coordinate text for a full-reference sequence index.
+
+        Intronic positions are numbered from the nearest flanking coding exon,
+        using the downstream exon on an exact midpoint tie to match mergeITD's
+        existing annotation convention.
+        """
+        if idx < 0 or idx >= len(self.sequence):
+            raise ValueError(f"Reference index {idx} lies outside FLT3.fa")
+        c_pos = self.c_by_index[idx]
+        if c_pos is not None:
+            return str(c_pos)
+
+        left = idx - 1
+        while left >= 0 and self.c_by_index[left] is None:
+            left -= 1
+        right = idx + 1
+        while right < len(self.sequence) and self.c_by_index[right] is None:
+            right += 1
+        if left < 0 or right >= len(self.sequence):
+            raise ValueError(
+                f"Reference index {idx} cannot be represented as an intronic c. coordinate"
+            )
+
+        left_c = self.c_by_index[left]
+        right_c = self.c_by_index[right]
+        assert left_c is not None and right_c is not None
+        left_distance = idx - left
+        right_distance = right - idx
+        if left_distance < right_distance:
+            return f"{left_c}+{left_distance}"
+        return f"{right_c}-{right_distance}"
 
     def sequence_index_for_genomic_pos(self, genomic_pos: int) -> int:
         if not self.genomic_start <= genomic_pos <= self.genomic_end:
@@ -762,16 +796,42 @@ def run_mergeitd(
     return output_dir / "filtered_mut_vaf.csv"
 
 
-def read_calls(path: Path, amplicon: Amplicon, contig: str) -> list[dict[str, str]]:
+def read_calls(
+    path: Path,
+    amplicon: Amplicon,
+    contig: str,
+    reference: Flt3Reference,
+) -> list[dict[str, str]]:
     calls = []
+    amplicon_reference = reference.extract_interval(amplicon.start, amplicon.end).upper()
+    first_genomic_pos = amplicon.end if reference.strand == "-" else amplicon.start + 1
+    full_reference_offset = reference.sequence_index_for_genomic_pos(first_genomic_pos)
+
     with path.open(newline="") as handle:
         for row in csv.DictReader(handle):
-            hgvs = row.get("HGVS", "")
-            if not hgvs:
+            if not row.get("HGVS", ""):
                 continue
+            mutation_name = row.get("name", "")
+            if not mutation_name:
+                raise ValueError("mergeITD call is missing its raw mutation name")
+
+            normalized = normalize_mergeitd_name(
+                mutation_name=mutation_name,
+                amplicon_reference=amplicon_reference,
+                full_reference=reference.sequence,
+                full_reference_offset=full_reference_offset,
+                coord_for_index=reference.hgvs_coord_for_index,
+            )
+            row["HGVS"] = f"{TRANSCRIPT}:{normalized.hgvs}"
+
+            site_idx = normalized.site_index
+            if site_idx == len(reference.sequence):
+                site_idx -= 1
+            if 0 <= site_idx < len(reference.region_by_index):
+                row["insertRegion"] = reference.region_by_index[site_idx]
             if row.get("insertRegion") not in {"exon14", "intron14", "exon15"}:
                 continue
-            row["HGVS"] = f"{TRANSCRIPT}:{hgvs}"
+
             row["amplicon"] = f"{contig}:{amplicon.label}"
             calls.append(row)
     return calls
@@ -1045,7 +1105,7 @@ def main() -> int:
                     min_reference_fraction=args.min_reference_fraction,
                     max_indel_fraction=args.max_indel_fraction,
                 )
-                all_calls.extend(read_calls(filtered, amplicon, contig))
+                all_calls.extend(read_calls(filtered, amplicon, contig, reference))
 
         if not all_calls:
             print("NO_FLT3_ITD")

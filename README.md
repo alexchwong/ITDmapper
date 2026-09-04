@@ -85,6 +85,8 @@ HGVS    netInsert    counts    vaf_percent    coverage    amplicon
 NM_004119.3:c....
 ```
 
+Before final output, mergeITD mutation coordinates are converted to sequence edits on the full packaged `FLT3.fa` reference and normalized to the most 3' sequence-equivalent representation in FLT3/transcript orientation. This normalization is not limited by inferred amplicon boundaries. Tandem insertions are emitted as `dup` when the normalized inserted sequence is a direct copy of the immediately 5' reference sequence. HGVS coordinate strings are generated only after this sequence-level normalization, including intronic `c.1837+...` / `c.1838-...` coordinates.
+
 or:
 
 ```text
@@ -174,5 +176,7 @@ From the repository root:
 ```
 
 `test_fastq_mode.py` covers automatic format detection, per-read FASTQ quality filtering, pre-assignment copy filtering, multiple amplicon discovery, reverse-orientation reads, alignment acceptance/rejection, and failure when discovery candidates do not overlap the FLT3 target.
+
+`test_hgvs_normalization.py` covers 3' shifting, tandem-repeat sequence rotation, insertion-to-duplication classification, normalization beyond inferred amplicon boundaries, intronic coordinate formatting, and normalization idempotence.
 
 `test_mergeitd_parity.py` continues to check that the extracted mergeITD core remains source-identical to `mergeitd.py`; FASTQ support does not modify the mergeITD core.
