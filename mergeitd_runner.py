@@ -4,29 +4,63 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from Bio import Align
 
+from itdmapper_settings import load_settings, validate_settings
 from mergeitd_core import alignITD, annotateCoords
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", required=True)
     parser.add_argument("--reads", required=True, type=Path)
     parser.add_argument("--reference", required=True, type=Path)
     parser.add_argument("--annotation", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--min-insert-seq-length", type=int, default=6)
-    parser.add_argument("--min-total-reads", type=int, default=1)
-    parser.add_argument("--min-vaf", type=float, default=0.006)
-    return parser.parse_args()
+    parser.add_argument("--settings", type=Path, default=None)
+    parser.add_argument("--match-score", type=float, default=None)
+    parser.add_argument("--mismatch-score", type=float, default=None)
+    parser.add_argument("--gap-open-score", type=float, default=None)
+    parser.add_argument("--gap-extend-score", type=float, default=None)
+    parser.add_argument("--min-aligned-block", type=int, default=None)
+    parser.add_argument("--min-reference-fraction", type=float, default=None)
+    parser.add_argument("--max-indel-fraction", type=float, default=None)
+    parser.add_argument("--min-insert-seq-length", type=int, default=None)
+    parser.add_argument("--min-total-reads", type=int, default=None)
+    parser.add_argument("--min-vaf", type=float, default=None)
+    return parser.parse_args(argv)
+
+
+def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
+    settings = load_settings(args.settings)
+    mappings = {
+        "match_score": ("alignment", "match"),
+        "mismatch_score": ("alignment", "mismatch"),
+        "gap_open_score": ("alignment", "gap_open"),
+        "gap_extend_score": ("alignment", "gap_extend"),
+        "min_aligned_block": ("alignment", "min_aligned_block"),
+        "min_reference_fraction": ("alignment", "min_reference_fraction"),
+        "max_indel_fraction": ("alignment", "max_indel_fraction"),
+        "min_insert_seq_length": ("calling", "min_insert_length"),
+        "min_total_reads": ("calling", "min_supporting_reads"),
+        "min_vaf": ("calling", "min_vaf_percent"),
+    }
+    effective = deepcopy(settings)
+    for attr, (section, key) in mappings.items():
+        if getattr(args, attr) is None:
+            setattr(args, attr, settings[section][key])
+        effective[section][key] = getattr(args, attr)
+    validate_settings(effective, source="CLI/settings")
+    return args
 
 
 def main() -> int:
-    args = parse_args()
+    args = resolve_args(parse_args())
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     prealigns = pd.read_csv(args.reads, sep="\t")
@@ -44,13 +78,13 @@ def main() -> int:
         "ANNO": anno,
         "PROGRESSBAR": False,
         "PLOT": False,
-        "COST_MATCH": 5,
-        "COST_MISMATCH": -15,
-        "COST_GAPOPEN": -36,
-        "COST_GAPEXTEND": -0.5,
-        "MIN_ALIGN_LEN": 6,
-        "MIN_REF_ALN_FRACTION": 0.4,
-        "MAX_FRAC_INDEL": 0.7,
+        "COST_MATCH": args.match_score,
+        "COST_MISMATCH": args.mismatch_score,
+        "COST_GAPOPEN": args.gap_open_score,
+        "COST_GAPEXTEND": args.gap_extend_score,
+        "MIN_ALIGN_LEN": args.min_aligned_block,
+        "MIN_REF_ALN_FRACTION": args.min_reference_fraction,
+        "MAX_FRAC_INDEL": args.max_indel_fraction,
         "MIN_INSERT_SEQ_LENGTH": args.min_insert_seq_length,
         "MIN_TOTAL_READS": args.min_total_reads,
         "MIN_VAF": args.min_vaf,

@@ -11,9 +11,12 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+
+from itdmapper_settings import load_settings, validate_settings
 
 try:
     import pysam
@@ -24,9 +27,16 @@ except ImportError:  # pragma: no cover - helper tests can run without pysam
 TRANSCRIPT = "NM_004119.3"
 TARGET_C_START = 1705
 TARGET_C_END = 1942
-DEFAULT_CLUSTER_TOLERANCE = 5
-DEFAULT_MIN_CLUSTER_FRACTION = 0.10
-TARGET_FETCH_FLANK = 1000
+_PACKAGED_SETTINGS = load_settings()
+DEFAULT_CLUSTER_TOLERANCE = int(_PACKAGED_SETTINGS["amplicon"]["endpoint_tolerance"])
+DEFAULT_MIN_CLUSTER_FRACTION = float(_PACKAGED_SETTINGS["amplicon"]["min_cluster_fraction"])
+DEFAULT_MIN_CLUSTER_SUPPORT = int(_PACKAGED_SETTINGS["amplicon"]["min_cluster_support"])
+DEFAULT_END_ANCHOR_TOLERANCE = int(_PACKAGED_SETTINGS["amplicon"]["end_anchor_tolerance"])
+DEFAULT_MIN_OVERLAP_FRACTION = float(_PACKAGED_SETTINGS["amplicon"]["min_overlap_fraction"])
+DEFAULT_MIN_MAPQ = int(_PACKAGED_SETTINGS["reads"]["min_mapq"])
+DEFAULT_MIN_MEAN_BASE_QUALITY = float(_PACKAGED_SETTINGS["reads"]["min_mean_base_quality"])
+DEFAULT_EXCLUDE_DUPLICATES = bool(_PACKAGED_SETTINGS["reads"]["exclude_duplicates"])
+DEFAULT_EXCLUDE_QCFAIL = bool(_PACKAGED_SETTINGS["reads"]["exclude_qcfail"])
 
 
 @dataclass(frozen=True)
@@ -221,20 +231,54 @@ def validate_bam(bam_path: Path):
     return bam
 
 
-def primary_target_reads(bam, contig: str, start0: int, end0: int):
-    reads = []
+def _mean_base_quality(read) -> Optional[float]:
+    qualities = read.query_qualities
+    if qualities is None or len(qualities) == 0:
+        return None
+    return sum(qualities) / len(qualities)
+
+
+def primary_target_reads(
+    bam,
+    contig: str,
+    start0: int,
+    end0: int,
+    min_mapq: int = DEFAULT_MIN_MAPQ,
+    min_mean_base_quality: float = DEFAULT_MIN_MEAN_BASE_QUALITY,
+    exclude_duplicates: bool = DEFAULT_EXCLUDE_DUPLICATES,
+    exclude_qcfail: bool = DEFAULT_EXCLUDE_QCFAIL,
+):
+    candidates = []
     for read in bam.fetch(contig, start0, end0):
         if read.is_unmapped or read.is_secondary or read.is_supplementary:
             continue
         if read.query_sequence is None or read.reference_end is None:
             continue
-        reads.append(read)
-    if not reads:
+        candidates.append(read)
+
+    if not candidates:
         raise ValueError("No primary reads overlap FLT3 exons 14-15")
-    if any(read.is_paired for read in reads):
+    if any(read.is_paired for read in candidates):
         raise ValueError(
             "Input BAM contains paired-end records; ITDmapper expects already-BBmerged single reads"
         )
+
+    reads = []
+    for read in candidates:
+        if min_mapq > 0 and read.mapping_quality < min_mapq:
+            continue
+        if exclude_duplicates and read.is_duplicate:
+            continue
+        if exclude_qcfail and read.is_qcfail:
+            continue
+        if min_mean_base_quality > 0:
+            mean_quality = _mean_base_quality(read)
+            if mean_quality is None or mean_quality < min_mean_base_quality:
+                continue
+        reads.append(read)
+
+    if not reads:
+        raise ValueError("No primary reads pass configured read-quality filters")
     return reads
 
 
@@ -271,6 +315,7 @@ def infer_amplicons(
     exon15_interval: tuple[int, int],
     tolerance: int = DEFAULT_CLUSTER_TOLERANCE,
     min_cluster_fraction: float = DEFAULT_MIN_CLUSTER_FRACTION,
+    min_cluster_support: int = DEFAULT_MIN_CLUSTER_SUPPORT,
 ) -> list[Amplicon]:
     """Infer amplicons from dominant genomic alignment endpoint pairs.
 
@@ -300,7 +345,7 @@ def infer_amplicons(
         raise ValueError("Unable to infer a FLT3 amplicon from BAM alignment endpoints")
 
     max_support = max(int(cluster["support"]) for cluster in clusters)
-    min_support = max(2, math.ceil(max_support * min_cluster_fraction))
+    min_support = max(min_cluster_support, math.ceil(max_support * min_cluster_fraction))
 
     amplicons = []
     for cluster in clusters:
@@ -317,7 +362,12 @@ def infer_amplicons(
     return amplicons
 
 
-def assign_reads_to_amplicons(reads, amplicons: list[Amplicon]):
+def assign_reads_to_amplicons(
+    reads,
+    amplicons: list[Amplicon],
+    end_anchor_tolerance: int = DEFAULT_END_ANCHOR_TOLERANCE,
+    min_overlap_fraction: float = DEFAULT_MIN_OVERLAP_FRACTION,
+):
     assigned: list[list] = [[] for _ in amplicons]
     for read in reads:
         scores = [
@@ -334,8 +384,8 @@ def assign_reads_to_amplicons(reads, amplicons: list[Amplicon]):
         end_anchor = min(
             abs(read.reference_start - amp.start),
             abs(read.reference_end - amp.end),
-        ) <= 10
-        if end_anchor or overlap >= 0.50 * amp.length:
+        ) <= end_anchor_tolerance
+        if end_anchor or overlap >= min_overlap_fraction * amp.length:
             assigned[idx].append(read)
     return assigned
 
@@ -383,6 +433,13 @@ def run_mergeitd(
     min_insert_seq_length: int,
     min_total_reads: int,
     min_vaf: float,
+    match_score: float,
+    mismatch_score: float,
+    gap_open_score: float,
+    gap_extend_score: float,
+    min_aligned_block: int,
+    min_reference_fraction: float,
+    max_indel_fraction: float,
 ) -> Path:
     output_dir = workdir / "mergeitd"
     cmd = [
@@ -396,6 +453,13 @@ def run_mergeitd(
         "--min-insert-seq-length", str(min_insert_seq_length),
         "--min-total-reads", str(min_total_reads),
         "--min-vaf", str(min_vaf),
+        "--match-score", str(match_score),
+        "--mismatch-score", str(mismatch_score),
+        "--gap-open-score", str(gap_open_score),
+        "--gap-extend-score", str(gap_extend_score),
+        "--min-aligned-block", str(min_aligned_block),
+        "--min-reference-fraction", str(min_reference_fraction),
+        "--max-indel-fraction", str(max_indel_fraction),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -419,24 +483,113 @@ def read_calls(path: Path, amplicon: Amplicon, contig: str) -> list[dict[str, st
     return calls
 
 
-def parse_args() -> argparse.Namespace:
+def _add_bool_override(
+    parser: argparse.ArgumentParser,
+    name: str,
+    dest: str,
+    enable_help: str,
+    disable_help: str,
+) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        f"--{name}", dest=dest, action="store_true", default=None, help=enable_help
+    )
+    group.add_argument(
+        f"--no-{name}", dest=dest, action="store_false", help=disable_help
+    )
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description="Call FLT3 insertions from an indexed hg19 BBmerged BAM using mergeITD alignment semantics."
     )
     parser.add_argument("bam", type=Path, help="coordinate-sorted, indexed single-read BAM")
     parser.add_argument(
+        "--settings",
+        type=Path,
+        default=None,
+        help="partial TOML settings file; CLI options override file values",
+    )
+    parser.add_argument(
         "--flt3-reference",
         type=Path,
         default=script_dir / "annotation" / "FLT3.fa",
         help="hg19 FLT3 genomic FASTA in transcript orientation (default: annotation/FLT3.fa)",
     )
-    parser.add_argument("--min-read-copies", type=int, default=2)
-    parser.add_argument("--min-insert-seq-length", type=int, default=6)
-    parser.add_argument("--min-total-reads", type=int, default=1)
-    parser.add_argument("--min-vaf", type=float, default=0.006, help="VAF percent, matching mergeITD")
+
+    parser.add_argument("--min-mapq", type=int, default=None)
+    parser.add_argument("--min-mean-base-quality", type=float, default=None)
+    _add_bool_override(
+        parser,
+        "exclude-duplicates",
+        "exclude_duplicates",
+        "Exclude BAM duplicate-flagged reads",
+        "Include BAM duplicate-flagged reads",
+    )
+    _add_bool_override(
+        parser,
+        "exclude-qcfail",
+        "exclude_qcfail",
+        "Exclude BAM QC-fail-flagged reads",
+        "Include BAM QC-fail-flagged reads",
+    )
+    parser.add_argument("--min-read-copies", type=int, default=None)
+
+    parser.add_argument("--endpoint-tolerance", type=int, default=None)
+    parser.add_argument("--min-cluster-fraction", type=float, default=None)
+    parser.add_argument("--min-cluster-support", type=int, default=None)
+    parser.add_argument("--target-fetch-flank", type=int, default=None)
+    parser.add_argument("--end-anchor-tolerance", type=int, default=None)
+    parser.add_argument("--min-overlap-fraction", type=float, default=None)
+
+    parser.add_argument("--match-score", type=float, default=None)
+    parser.add_argument("--mismatch-score", type=float, default=None)
+    parser.add_argument("--gap-open-score", type=float, default=None)
+    parser.add_argument("--gap-extend-score", type=float, default=None)
+    parser.add_argument("--min-aligned-block", type=int, default=None)
+    parser.add_argument("--min-reference-fraction", type=float, default=None)
+    parser.add_argument("--max-indel-fraction", type=float, default=None)
+
+    parser.add_argument("--min-insert-seq-length", type=int, default=None)
+    parser.add_argument("--min-total-reads", type=int, default=None)
+    parser.add_argument("--min-vaf", type=float, default=None, help="VAF percent, matching mergeITD")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
+    settings = load_settings(args.settings)
+    mappings = {
+        "min_mapq": ("reads", "min_mapq"),
+        "min_mean_base_quality": ("reads", "min_mean_base_quality"),
+        "exclude_duplicates": ("reads", "exclude_duplicates"),
+        "exclude_qcfail": ("reads", "exclude_qcfail"),
+        "min_read_copies": ("reads", "min_read_copies"),
+        "endpoint_tolerance": ("amplicon", "endpoint_tolerance"),
+        "min_cluster_fraction": ("amplicon", "min_cluster_fraction"),
+        "min_cluster_support": ("amplicon", "min_cluster_support"),
+        "target_fetch_flank": ("amplicon", "target_fetch_flank"),
+        "end_anchor_tolerance": ("amplicon", "end_anchor_tolerance"),
+        "min_overlap_fraction": ("amplicon", "min_overlap_fraction"),
+        "match_score": ("alignment", "match"),
+        "mismatch_score": ("alignment", "mismatch"),
+        "gap_open_score": ("alignment", "gap_open"),
+        "gap_extend_score": ("alignment", "gap_extend"),
+        "min_aligned_block": ("alignment", "min_aligned_block"),
+        "min_reference_fraction": ("alignment", "min_reference_fraction"),
+        "max_indel_fraction": ("alignment", "max_indel_fraction"),
+        "min_insert_seq_length": ("calling", "min_insert_length"),
+        "min_total_reads": ("calling", "min_supporting_reads"),
+        "min_vaf": ("calling", "min_vaf_percent"),
+    }
+    effective = deepcopy(settings)
+    for attr, (section, key) in mappings.items():
+        if getattr(args, attr) is None:
+            setattr(args, attr, settings[section][key])
+        effective[section][key] = getattr(args, attr)
+    validate_settings(effective, source="CLI/settings")
+    return args
 
 
 def main() -> int:
@@ -445,6 +598,7 @@ def main() -> int:
     runner = script_dir / "mergeitd_runner.py"
 
     try:
+        args = resolve_args(args)
         reference = Flt3Reference.load(args.flt3_reference)
         bam = validate_bam(args.bam)
         try:
@@ -452,11 +606,32 @@ def main() -> int:
             target_start0, target_end0 = reference.target_fetch_interval()
             exon14_interval = reference.genomic_interval_for_region("exon14")
             exon15_interval = reference.genomic_interval_for_region("exon15")
-            fetch_start0 = max(0, target_start0 - TARGET_FETCH_FLANK)
-            fetch_end0 = target_end0 + TARGET_FETCH_FLANK
-            reads = primary_target_reads(bam, contig, fetch_start0, fetch_end0)
-            amplicons = infer_amplicons(reads, exon14_interval, exon15_interval)
-            read_groups = assign_reads_to_amplicons(reads, amplicons)
+            fetch_start0 = max(0, target_start0 - args.target_fetch_flank)
+            fetch_end0 = target_end0 + args.target_fetch_flank
+            reads = primary_target_reads(
+                bam,
+                contig,
+                fetch_start0,
+                fetch_end0,
+                min_mapq=args.min_mapq,
+                min_mean_base_quality=args.min_mean_base_quality,
+                exclude_duplicates=args.exclude_duplicates,
+                exclude_qcfail=args.exclude_qcfail,
+            )
+            amplicons = infer_amplicons(
+                reads,
+                exon14_interval,
+                exon15_interval,
+                tolerance=args.endpoint_tolerance,
+                min_cluster_fraction=args.min_cluster_fraction,
+                min_cluster_support=args.min_cluster_support,
+            )
+            read_groups = assign_reads_to_amplicons(
+                reads,
+                amplicons,
+                end_anchor_tolerance=args.end_anchor_tolerance,
+                min_overlap_fraction=args.min_overlap_fraction,
+            )
         finally:
             bam.close()
 
@@ -497,6 +672,13 @@ def main() -> int:
                     min_insert_seq_length=args.min_insert_seq_length,
                     min_total_reads=args.min_total_reads,
                     min_vaf=args.min_vaf,
+                    match_score=args.match_score,
+                    mismatch_score=args.mismatch_score,
+                    gap_open_score=args.gap_open_score,
+                    gap_extend_score=args.gap_extend_score,
+                    min_aligned_block=args.min_aligned_block,
+                    min_reference_fraction=args.min_reference_fraction,
+                    max_indel_fraction=args.max_indel_fraction,
                 )
                 all_calls.extend(read_calls(filtered, amplicon, contig))
 

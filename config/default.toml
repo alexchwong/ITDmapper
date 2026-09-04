@@ -1,0 +1,43 @@
+# ITDmapper packaged defaults.
+# Custom settings files may contain only the keys they need to override.
+
+[reads]
+# 0 disables MAPQ filtering.
+min_mapq = 0
+# 0 disables mean base-quality filtering. The mean is calculated across BAM SEQ qualities.
+min_mean_base_quality = 0.0
+# Preserve historical behaviour unless explicitly enabled.
+exclude_duplicates = false
+exclude_qcfail = false
+# Unique sequence must be observed at least this many times before mergeITD analysis.
+min_read_copies = 2
+
+[amplicon]
+# Cluster near-identical alignment start/end pairs within this many bases.
+endpoint_tolerance = 5
+# Retain clusters with at least this fraction of the dominant cluster support.
+min_cluster_fraction = 0.10
+# Absolute floor for endpoint-cluster support.
+min_cluster_support = 2
+# Fetch this many bases beyond the exon 14-15 target when collecting reads.
+target_fetch_flank = 1000
+# A read is assigned when either end lies within this distance of an inferred amplicon end.
+end_anchor_tolerance = 10
+# Otherwise require this fraction of the inferred amplicon to overlap the read alignment span.
+min_overlap_fraction = 0.50
+
+[alignment]
+# Legacy mergeITD PairwiseAligner scoring/acceptance parameters.
+match = 5
+mismatch = -15
+gap_open = -36
+gap_extend = -0.5
+min_aligned_block = 6
+min_reference_fraction = 0.4
+max_indel_fraction = 0.7
+
+[calling]
+min_insert_length = 6
+min_supporting_reads = 1
+# Percent, matching mergeITD semantics (0.006 means 0.006%).
+min_vaf_percent = 0.006

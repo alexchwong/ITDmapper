@@ -39,7 +39,45 @@ or:
 NO_FLT3_ITD
 ```
 
-### mergeITD defaults retained
+## Settings and quality filters
+
+All runtime thresholds are defined in the packaged `config/default.toml`. A custom TOML file can contain only the values that need to change:
+
+```bash
+python itdmapper.py sample.bam --settings config/default.toml
+```
+
+Explicit CLI options override both the custom file and packaged defaults. For example:
+
+```bash
+python itdmapper.py sample.bam \
+  --settings config/default.toml \
+  --min-mapq 20 \
+  --min-vaf 0.1
+```
+
+Unknown TOML sections or keys are rejected so misspelled settings do not silently fall back to defaults.
+
+### Packaged defaults
+
+Read filters:
+
+- minimum MAPQ: `0` (disabled)
+- minimum mean base quality: `0` (disabled)
+- exclude duplicate-flagged reads: `false`
+- exclude QC-fail-flagged reads: `false`
+- minimum identical read copies: `2`
+
+Amplicon inference/assignment:
+
+- endpoint cluster tolerance: `5 bp`
+- minimum cluster fraction relative to the dominant cluster: `0.10`
+- minimum endpoint-cluster support: `2 reads`
+- target fetch flank: `1000 bp`
+- end-anchor tolerance: `10 bp`
+- minimum overlap fraction when an end is not anchored: `0.50`
+
+mergeITD alignment:
 
 - match: `5`
 - mismatch: `-15`
@@ -48,12 +86,42 @@ NO_FLT3_ITD
 - minimum aligned block: `6 bp`
 - minimum reference aligned fraction: `0.4`
 - maximum indel fraction: `0.7`
-- minimum read copies: `2`
+
+Call filtering:
+
 - minimum net insertion: `6 bp`
 - minimum supporting reads: `1`
 - minimum VAF: `0.006%`
 
-The last four thresholds can be adjusted from the CLI where applicable; alignment scoring is intentionally fixed to the legacy mergeITD values.
+The new MAPQ, mean-base-quality, duplicate, and QC-fail filters default to disabled, preserving the prior BAM-input behaviour. Unmapped, secondary and supplementary alignments are always excluded, and paired-end records are still rejected because the expected input is an already-BBmerged single-read BAM.
+
+### CLI overrides
+
+The principal settings can also be changed directly:
+
+```text
+--min-mapq
+--min-mean-base-quality
+--exclude-duplicates / --no-exclude-duplicates
+--exclude-qcfail / --no-exclude-qcfail
+--min-read-copies
+--endpoint-tolerance
+--min-cluster-fraction
+--min-cluster-support
+--target-fetch-flank
+--end-anchor-tolerance
+--min-overlap-fraction
+--match-score
+--mismatch-score
+--gap-open-score
+--gap-extend-score
+--min-aligned-block
+--min-reference-fraction
+--max-indel-fraction
+--min-insert-seq-length
+--min-total-reads
+--min-vaf
+```
 
 ## Tests
 
@@ -63,4 +131,4 @@ The test suite uses Python's built-in `unittest` framework. From the repository 
 .env/bin/python -m unittest discover -s tests -v
 ```
 
-`test_mergeitd_parity.py` checks that the extracted core functions remain source-identical (apart from trailing whitespace) to `mergeitd.py`. `test_cli.py` uses the BAM under `fixtures/` when `pysam` is installed.
+`test_mergeitd_parity.py` checks that the extracted core functions remain source-identical (apart from trailing whitespace) to `mergeitd.py`. `test_cli.py` uses the BAM under `fixtures/` when `pysam` is installed. `test_settings.py` checks settings precedence, validation, and read-quality filtering.
