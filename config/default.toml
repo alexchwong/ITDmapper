@@ -2,14 +2,15 @@
 # Custom settings files may contain only the keys they need to override.
 
 [reads]
-# 0 disables MAPQ filtering.
+# 0 disables MAPQ filtering (BAM only).
 min_mapq = 0
-# 0 disables mean base-quality filtering. The mean is calculated across BAM SEQ qualities.
+# 0 disables mean base-quality filtering. FASTQ filtering is per raw read before collapsing.
 min_mean_base_quality = 0.0
-# Preserve historical behaviour unless explicitly enabled.
+# BAM-only flags; preserve historical behaviour unless explicitly enabled.
 exclude_duplicates = false
 exclude_qcfail = false
-# Unique sequence must be observed at least this many times before mergeITD analysis.
+# Unique sequence must be observed at least this many times before analysis.
+# In FASTQ mode this is applied before amplicon discovery and assignment.
 min_read_copies = 2
 
 [amplicon]
@@ -17,14 +18,19 @@ min_read_copies = 2
 endpoint_tolerance = 5
 # Retain clusters with at least this fraction of the dominant cluster support.
 min_cluster_fraction = 0.10
-# Absolute floor for endpoint-cluster support.
+# Absolute floor for endpoint-cluster support, weighted by read count.
 min_cluster_support = 2
-# Fetch this many bases beyond the exon 14-15 target when collecting reads.
+# BAM: fetch this many bases beyond the exon 14-15 target.
+# FASTQ: search this broad FLT3 window around the target for amplicon discovery.
 target_fetch_flank = 1000
-# A read is assigned when either end lies within this distance of an inferred amplicon end.
+# BAM assignment: one read end may anchor within this distance of an inferred amplicon end.
 end_anchor_tolerance = 10
-# Otherwise require this fraction of the inferred amplicon to overlap the read alignment span.
+# BAM assignment fallback: minimum genomic overlap with the inferred amplicon.
 min_overlap_fraction = 0.50
+
+[fastq]
+# Amplicon discovery uses the most abundant unique sequences after quality/copy filtering.
+discovery_top_unique = 10
 
 [alignment]
 # Legacy mergeITD PairwiseAligner scoring/acceptance parameters.
@@ -33,7 +39,10 @@ mismatch = -15
 gap_open = -36
 gap_extend = -0.5
 min_aligned_block = 6
+# Minimum fraction of an inferred amplicon spanned by an accepted FASTQ sequence.
 min_reference_fraction = 0.4
+# Minimum fraction of a FASTQ sequence represented by aligned blocks.
+min_query_fraction = 0.3
 max_indel_fraction = 0.7
 
 [calling]

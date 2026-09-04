@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""FLT3 ITD caller for indexed, coordinate-sorted BBmerged BAM files."""
+"""FLT3 ITD caller for BBmerged BAM or FASTQ inputs."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import math
 import re
 import subprocess
@@ -15,6 +16,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+
+from Bio import Align, SeqIO
 
 from itdmapper_settings import load_settings, validate_settings
 
@@ -52,6 +55,26 @@ class Amplicon:
     @property
     def label(self) -> str:
         return f"{self.start + 1}-{self.end}"
+
+
+@dataclass(frozen=True)
+class AlignmentMetrics:
+    sequence: str
+    score: float
+    query_start: int
+    query_end: int
+    reference_start: int
+    reference_end: int
+    query_aligned_bases: int
+    indel_bases: int
+
+    @property
+    def query_span(self) -> int:
+        return self.query_end - self.query_start
+
+    @property
+    def reference_span(self) -> int:
+        return self.reference_end - self.reference_start
 
 
 @dataclass
@@ -169,6 +192,18 @@ class Flt3Reference:
             last_idx = self.sequence_index_for_genomic_pos(high1)
         return self.sequence[first_idx:last_idx + 1]
 
+    def reference_span_to_genomic(
+        self,
+        interval_start0: int,
+        interval_end0: int,
+        reference_start: int,
+        reference_end: int,
+    ) -> tuple[int, int]:
+        """Convert coordinates within extract_interval() back to genomic coordinates."""
+        if self.strand == "-":
+            return interval_end0 - reference_end, interval_end0 - reference_start
+        return interval_start0 + reference_start, interval_start0 + reference_end
+
     def annotation_rows(self, start0: int, end0: int) -> list[dict[str, object]]:
         """Build mergeITD annotation rows for an inferred amplicon."""
         rows: list[dict[str, object]] = []
@@ -195,6 +230,19 @@ class Flt3Reference:
 
 def reverse_complement(sequence: str) -> str:
     return sequence.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
+
+
+def detect_input_format(path: Path, override: Optional[str] = None) -> str:
+    if override is not None:
+        return override
+    name = path.name.lower()
+    if name.endswith(".bam"):
+        return "bam"
+    if name.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz")):
+        return "fastq"
+    raise ValueError(
+        f"Unable to infer input format from {path.name!r}; use --input-format bam|fastq"
+    )
 
 
 def resolve_bam_contig(bam, reference_chrom: str) -> str:
@@ -282,6 +330,52 @@ def primary_target_reads(
     return reads
 
 
+def load_fastq_sequence_counts(
+    fastq_path: Path,
+    min_mean_base_quality: float,
+    min_read_copies: int,
+) -> tuple[Counter[str], int, int]:
+    """Quality-filter raw FASTQ reads, then collapse exact sequences.
+
+    Returns (filtered sequence counts, raw read count, quality-passing read count).
+    The minimum-copy filter is applied after collapsing and before discovery or
+    amplicon assignment.
+    """
+    if not fastq_path.is_file():
+        raise ValueError(f"FASTQ not found: {fastq_path}")
+    opener = gzip.open if fastq_path.name.lower().endswith(".gz") else open
+    counts: Counter[str] = Counter()
+    raw_reads = 0
+    quality_passing_reads = 0
+    try:
+        with opener(fastq_path, "rt") as handle:
+            for record in SeqIO.parse(handle, "fastq"):
+                raw_reads += 1
+                qualities = record.letter_annotations.get("phred_quality", [])
+                if min_mean_base_quality > 0:
+                    if not qualities or (sum(qualities) / len(qualities)) < min_mean_base_quality:
+                        continue
+                sequence = str(record.seq).upper()
+                if not sequence:
+                    continue
+                quality_passing_reads += 1
+                counts[sequence] += 1
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"Unable to read FASTQ {fastq_path}: {exc}") from exc
+
+    if raw_reads == 0:
+        raise ValueError("FASTQ contains no reads")
+    if quality_passing_reads == 0:
+        raise ValueError("No FASTQ reads pass configured read-quality filters")
+
+    counts = Counter({seq: n for seq, n in counts.items() if n >= min_read_copies})
+    if not counts:
+        raise ValueError(
+            "No FASTQ sequences remain after applying the minimum identical-read-copy filter"
+        )
+    return counts, raw_reads, quality_passing_reads
+
+
 def _cluster_endpoint_pairs(
     pair_counts: Counter[tuple[int, int]], tolerance: int
 ) -> list[dict[str, object]]:
@@ -309,6 +403,30 @@ def _cluster_endpoint_pairs(
     return clusters
 
 
+def _clusters_to_amplicons(
+    clusters: list[dict[str, object]],
+    min_cluster_fraction: float,
+    min_cluster_support: int,
+    error_message: str,
+) -> list[Amplicon]:
+    if not clusters:
+        raise ValueError(error_message)
+    max_support = max(int(cluster["support"]) for cluster in clusters)
+    min_support = max(min_cluster_support, math.ceil(max_support * min_cluster_fraction))
+    amplicons = []
+    for cluster in clusters:
+        support = int(cluster["support"])
+        if support < min_support:
+            continue
+        start, end = cluster["representative"]
+        if start < end:
+            amplicons.append(Amplicon(start=start, end=end, support=support))
+    amplicons.sort(key=lambda amp: (-amp.support, amp.start, amp.end))
+    if not amplicons:
+        raise ValueError(error_message)
+    return amplicons
+
+
 def infer_amplicons(
     reads,
     exon14_interval: tuple[int, int],
@@ -317,13 +435,7 @@ def infer_amplicons(
     min_cluster_fraction: float = DEFAULT_MIN_CLUSTER_FRACTION,
     min_cluster_support: int = DEFAULT_MIN_CLUSTER_SUPPORT,
 ) -> list[Amplicon]:
-    """Infer amplicons from dominant genomic alignment endpoint pairs.
-
-    Primary reads overlapping both exon 14 and exon 15 are used as anchors so
-    shorter exon14-to-exon15 amplicons remain eligible while ITD/soft-clipped
-    outliers cannot expand the WT reference. Near-identical endpoint pairs are
-    clustered to tolerate small alignment shifts.
-    """
+    """Infer BAM amplicons from dominant genomic alignment endpoint pairs."""
     exon14_start, exon14_end = exon14_interval
     exon15_start, exon15_end = exon15_interval
 
@@ -341,25 +453,145 @@ def infer_amplicons(
 
     pair_counts = Counter((r.reference_start, r.reference_end) for r in anchors)
     clusters = _cluster_endpoint_pairs(pair_counts, tolerance)
-    if not clusters:
-        raise ValueError("Unable to infer a FLT3 amplicon from BAM alignment endpoints")
+    return _clusters_to_amplicons(
+        clusters,
+        min_cluster_fraction,
+        min_cluster_support,
+        "No sufficiently supported FLT3 amplicon endpoint cluster found",
+    )
 
-    max_support = max(int(cluster["support"]) for cluster in clusters)
-    min_support = max(min_cluster_support, math.ceil(max_support * min_cluster_fraction))
 
-    amplicons = []
-    for cluster in clusters:
-        if int(cluster["support"]) < min_support:
+def _make_aligner(match: float, mismatch: float, gap_open: float, gap_extend: float):
+    aligner = Align.PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = match
+    aligner.mismatch_score = mismatch
+    aligner.open_gap_score = gap_open
+    aligner.extend_gap_score = gap_extend
+    aligner.target_end_gap_score = 0.0
+    aligner.query_end_gap_score = 0.0
+    return aligner
+
+
+def _alignment_metrics(
+    sequence: str,
+    reference: str,
+    aligner,
+    min_aligned_block: int,
+) -> Optional[AlignmentMetrics]:
+    alignments = aligner.align(sequence, reference)
+    if not alignments:
+        return None
+    aln = alignments[-1]
+    coords = aln.coordinates
+    q_blocks: list[tuple[int, int]] = []
+    r_blocks: list[tuple[int, int]] = []
+    for j in range(len(coords[0]) - 1):
+        q0, q1 = int(coords[0][j]), int(coords[0][j + 1])
+        r0, r1 = int(coords[1][j]), int(coords[1][j + 1])
+        if q1 - q0 >= min_aligned_block and r1 - r0 >= min_aligned_block:
+            q_blocks.append((q0, q1))
+            r_blocks.append((r0, r1))
+    if not q_blocks:
+        return None
+
+    indel_bases = 0
+    for i in range(len(q_blocks) - 1):
+        q_gap = q_blocks[i + 1][0] - q_blocks[i][1]
+        r_gap = r_blocks[i + 1][0] - r_blocks[i][1]
+        indel_bases += max(0, q_gap) + max(0, r_gap)
+
+    return AlignmentMetrics(
+        sequence=sequence,
+        score=float(aln.score),
+        query_start=q_blocks[0][0],
+        query_end=q_blocks[-1][1],
+        reference_start=r_blocks[0][0],
+        reference_end=r_blocks[-1][1],
+        query_aligned_bases=sum(q1 - q0 for q0, q1 in q_blocks),
+        indel_bases=indel_bases,
+    )
+
+
+def _best_orientation_metrics(
+    sequence: str,
+    reference: str,
+    aligner,
+    min_aligned_block: int,
+) -> Optional[AlignmentMetrics]:
+    options = []
+    for oriented in (sequence.upper(), reverse_complement(sequence.upper())):
+        metrics = _alignment_metrics(oriented, reference, aligner, min_aligned_block)
+        if metrics is not None:
+            options.append(metrics)
+    if not options:
+        return None
+    return max(
+        options,
+        key=lambda m: (m.score, m.query_aligned_bases, m.reference_span),
+    )
+
+
+def discover_amplicons_from_sequences(
+    sequence_counts: Counter[str],
+    reference: Flt3Reference,
+    target_interval: tuple[int, int],
+    discovery_flank: int,
+    top_unique: int,
+    endpoint_tolerance: int,
+    min_cluster_fraction: float,
+    min_cluster_support: int,
+    match_score: float,
+    mismatch_score: float,
+    gap_open_score: float,
+    gap_extend_score: float,
+    min_aligned_block: int,
+    min_query_fraction: float,
+    max_indel_fraction: float,
+) -> list[Amplicon]:
+    """Infer FASTQ amplicons from the most abundant unique sequences.
+
+    Discovery is performed against a broad FLT3 window around the exon14-15 target.
+    Candidate amplicons must overlap the target but may extend beyond it.
+    Endpoint support is weighted by the collapsed read count.
+    """
+    target_start0, target_end0 = target_interval
+    reference_start0 = reference.genomic_start - 1
+    reference_end0 = reference.genomic_end
+    discovery_start0 = max(reference_start0, target_start0 - discovery_flank)
+    discovery_end0 = min(reference_end0, target_end0 + discovery_flank)
+    discovery_ref = reference.extract_interval(discovery_start0, discovery_end0).upper()
+    aligner = _make_aligner(match_score, mismatch_score, gap_open_score, gap_extend_score)
+
+    pair_counts: Counter[tuple[int, int]] = Counter()
+    for sequence, count in sequence_counts.most_common(top_unique):
+        metrics = _best_orientation_metrics(
+            sequence, discovery_ref, aligner, min_aligned_block
+        )
+        if metrics is None:
             continue
-        start, end = cluster["representative"]
-        if start >= end:
+        query_fraction = metrics.query_aligned_bases / len(metrics.sequence)
+        denominator = metrics.indel_bases + metrics.reference_span
+        indel_fraction = metrics.indel_bases / denominator if denominator else 1.0
+        if query_fraction < min_query_fraction or indel_fraction > max_indel_fraction:
             continue
-        amplicons.append(Amplicon(start=start, end=end, support=int(cluster["support"])))
+        start0, end0 = reference.reference_span_to_genomic(
+            discovery_start0,
+            discovery_end0,
+            metrics.reference_start,
+            metrics.reference_end,
+        )
+        if start0 >= target_end0 or end0 <= target_start0:
+            continue
+        pair_counts[(start0, end0)] += count
 
-    amplicons.sort(key=lambda amp: (-amp.support, amp.start, amp.end))
-    if not amplicons:
-        raise ValueError("No sufficiently supported FLT3 amplicon endpoint cluster found")
-    return amplicons
+    clusters = _cluster_endpoint_pairs(pair_counts, endpoint_tolerance)
+    return _clusters_to_amplicons(
+        clusters,
+        min_cluster_fraction,
+        min_cluster_support,
+        "Unable to infer a sufficiently supported FLT3 amplicon from FASTQ sequences",
+    )
 
 
 def assign_reads_to_amplicons(
@@ -379,8 +611,6 @@ def assign_reads_to_amplicons(
         overlap = max(0, min(read.reference_end, amp.end) - max(read.reference_start, amp.start))
         if overlap == 0:
             continue
-        # At least one amplicon end should remain anchored, or the genomic span
-        # should still substantially overlap the inferred WT amplicon.
         end_anchor = min(
             abs(read.reference_start - amp.start),
             abs(read.reference_end - amp.end),
@@ -390,11 +620,75 @@ def assign_reads_to_amplicons(
     return assigned
 
 
+def assign_sequence_counts_to_amplicons(
+    sequence_counts: Counter[str],
+    amplicons: list[Amplicon],
+    reference: Flt3Reference,
+    match_score: float,
+    mismatch_score: float,
+    gap_open_score: float,
+    gap_extend_score: float,
+    min_aligned_block: int,
+    min_reference_fraction: float,
+    min_query_fraction: float,
+    max_indel_fraction: float,
+) -> tuple[list[Counter[str]], int, int]:
+    """Assign collapsed FASTQ sequences to their best acceptable amplicon.
+
+    Both read orientations are tested. A sequence must satisfy the configured
+    reference coverage, query coverage and indel-fraction criteria against at
+    least one amplicon. Accepted sequences are normalized to FLT3 transcript
+    orientation before downstream mergeITD calling.
+    """
+    aligner = _make_aligner(match_score, mismatch_score, gap_open_score, gap_extend_score)
+    amp_refs = [reference.extract_interval(amp.start, amp.end).upper() for amp in amplicons]
+    assigned: list[Counter[str]] = [Counter() for _ in amplicons]
+    accepted_reads = 0
+    rejected_reads = 0
+
+    for sequence, count in sequence_counts.items():
+        candidates = []
+        for idx, (amp, amp_ref) in enumerate(zip(amplicons, amp_refs)):
+            metrics = _best_orientation_metrics(sequence, amp_ref, aligner, min_aligned_block)
+            if metrics is None:
+                continue
+            reference_fraction = metrics.reference_span / amp.length
+            query_fraction = metrics.query_aligned_bases / len(metrics.sequence)
+            denominator = metrics.indel_bases + metrics.reference_span
+            indel_fraction = metrics.indel_bases / denominator if denominator else 1.0
+            if reference_fraction < min_reference_fraction:
+                continue
+            if query_fraction < min_query_fraction:
+                continue
+            if indel_fraction > max_indel_fraction:
+                continue
+            candidates.append(
+                (
+                    reference_fraction,
+                    query_fraction,
+                    metrics.score,
+                    amp.support,
+                    -idx,
+                    idx,
+                    metrics.sequence,
+                )
+            )
+
+        if not candidates:
+            rejected_reads += count
+            continue
+        best = max(candidates)
+        idx = best[5]
+        oriented_sequence = best[6]
+        assigned[idx][oriented_sequence] += count
+        accepted_reads += count
+
+    return assigned, accepted_reads, rejected_reads
+
+
 def sequence_counts(reads, strand: str) -> Counter[str]:
     counts: Counter[str] = Counter()
     for read in reads:
-        # BAM SEQ is stored in reference alignment orientation. FLT3.fa is in
-        # transcript orientation (minus strand for this hg19 reference).
         sequence = read.query_sequence
         if strand == "-":
             sequence = reverse_complement(sequence)
@@ -414,7 +708,7 @@ def write_annotation(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def write_sequence_counts(path: Path, counts: Counter[str], min_read_copies: int) -> None:
+def write_sequence_counts(path: Path, counts: Counter[str], min_read_copies: int = 1) -> None:
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(["Sequence", "Counts", "SeqLength"])
@@ -502,9 +796,15 @@ def _add_bool_override(
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Call FLT3 insertions from an indexed hg19 BBmerged BAM using mergeITD alignment semantics."
+        description="Call FLT3 insertions from already-BBmerged BAM or FASTQ fragments."
     )
-    parser.add_argument("bam", type=Path, help="coordinate-sorted, indexed single-read BAM")
+    parser.add_argument("input", type=Path, help="input .bam, .fastq/.fq, or gzipped FASTQ")
+    parser.add_argument(
+        "--input-format",
+        choices=("bam", "fastq"),
+        default=None,
+        help="override automatic input-format detection",
+    )
     parser.add_argument(
         "--settings",
         type=Path,
@@ -542,6 +842,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--target-fetch-flank", type=int, default=None)
     parser.add_argument("--end-anchor-tolerance", type=int, default=None)
     parser.add_argument("--min-overlap-fraction", type=float, default=None)
+    parser.add_argument("--fastq-discovery-top-unique", type=int, default=None)
 
     parser.add_argument("--match-score", type=float, default=None)
     parser.add_argument("--mismatch-score", type=float, default=None)
@@ -549,6 +850,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--gap-extend-score", type=float, default=None)
     parser.add_argument("--min-aligned-block", type=int, default=None)
     parser.add_argument("--min-reference-fraction", type=float, default=None)
+    parser.add_argument("--min-query-fraction", type=float, default=None)
     parser.add_argument("--max-indel-fraction", type=float, default=None)
 
     parser.add_argument("--min-insert-seq-length", type=int, default=None)
@@ -572,12 +874,14 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         "target_fetch_flank": ("amplicon", "target_fetch_flank"),
         "end_anchor_tolerance": ("amplicon", "end_anchor_tolerance"),
         "min_overlap_fraction": ("amplicon", "min_overlap_fraction"),
+        "fastq_discovery_top_unique": ("fastq", "discovery_top_unique"),
         "match_score": ("alignment", "match"),
         "mismatch_score": ("alignment", "mismatch"),
         "gap_open_score": ("alignment", "gap_open"),
         "gap_extend_score": ("alignment", "gap_extend"),
         "min_aligned_block": ("alignment", "min_aligned_block"),
         "min_reference_fraction": ("alignment", "min_reference_fraction"),
+        "min_query_fraction": ("alignment", "min_query_fraction"),
         "max_indel_fraction": ("alignment", "max_indel_fraction"),
         "min_insert_seq_length": ("calling", "min_insert_length"),
         "min_total_reads": ("calling", "min_supporting_reads"),
@@ -592,6 +896,14 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def _sample_name(path: Path) -> str:
+    name = path.name
+    for suffix in (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".bam"):
+        if name.lower().endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
 def main() -> int:
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
@@ -599,73 +911,126 @@ def main() -> int:
 
     try:
         args = resolve_args(args)
+        input_format = detect_input_format(args.input, args.input_format)
         reference = Flt3Reference.load(args.flt3_reference)
-        bam = validate_bam(args.bam)
-        try:
-            contig = resolve_bam_contig(bam, reference.chrom)
-            target_start0, target_end0 = reference.target_fetch_interval()
-            exon14_interval = reference.genomic_interval_for_region("exon14")
-            exon15_interval = reference.genomic_interval_for_region("exon15")
-            fetch_start0 = max(0, target_start0 - args.target_fetch_flank)
-            fetch_end0 = target_end0 + args.target_fetch_flank
-            reads = primary_target_reads(
-                bam,
-                contig,
-                fetch_start0,
-                fetch_end0,
-                min_mapq=args.min_mapq,
+        target_start0, target_end0 = reference.target_fetch_interval()
+        contig = reference.chrom
+
+        if input_format == "bam":
+            bam = validate_bam(args.input)
+            try:
+                contig = resolve_bam_contig(bam, reference.chrom)
+                exon14_interval = reference.genomic_interval_for_region("exon14")
+                exon15_interval = reference.genomic_interval_for_region("exon15")
+                fetch_start0 = max(0, target_start0 - args.target_fetch_flank)
+                fetch_end0 = target_end0 + args.target_fetch_flank
+                reads = primary_target_reads(
+                    bam,
+                    contig,
+                    fetch_start0,
+                    fetch_end0,
+                    min_mapq=args.min_mapq,
+                    min_mean_base_quality=args.min_mean_base_quality,
+                    exclude_duplicates=args.exclude_duplicates,
+                    exclude_qcfail=args.exclude_qcfail,
+                )
+                amplicons = infer_amplicons(
+                    reads,
+                    exon14_interval,
+                    exon15_interval,
+                    tolerance=args.endpoint_tolerance,
+                    min_cluster_fraction=args.min_cluster_fraction,
+                    min_cluster_support=args.min_cluster_support,
+                )
+                bam_groups = assign_reads_to_amplicons(
+                    reads,
+                    amplicons,
+                    end_anchor_tolerance=args.end_anchor_tolerance,
+                    min_overlap_fraction=args.min_overlap_fraction,
+                )
+                read_groups = [sequence_counts(group, reference.strand) for group in bam_groups]
+                min_output_copies = args.min_read_copies
+            finally:
+                bam.close()
+        else:
+            sequence_count_map, raw_reads, quality_passing_reads = load_fastq_sequence_counts(
+                args.input,
                 min_mean_base_quality=args.min_mean_base_quality,
-                exclude_duplicates=args.exclude_duplicates,
-                exclude_qcfail=args.exclude_qcfail,
+                min_read_copies=args.min_read_copies,
             )
-            amplicons = infer_amplicons(
-                reads,
-                exon14_interval,
-                exon15_interval,
-                tolerance=args.endpoint_tolerance,
+            amplicons = discover_amplicons_from_sequences(
+                sequence_count_map,
+                reference,
+                (target_start0, target_end0),
+                discovery_flank=args.target_fetch_flank,
+                top_unique=args.fastq_discovery_top_unique,
+                endpoint_tolerance=args.endpoint_tolerance,
                 min_cluster_fraction=args.min_cluster_fraction,
                 min_cluster_support=args.min_cluster_support,
+                match_score=args.match_score,
+                mismatch_score=args.mismatch_score,
+                gap_open_score=args.gap_open_score,
+                gap_extend_score=args.gap_extend_score,
+                min_aligned_block=args.min_aligned_block,
+                min_query_fraction=args.min_query_fraction,
+                max_indel_fraction=args.max_indel_fraction,
             )
-            read_groups = assign_reads_to_amplicons(
-                reads,
+            read_groups, accepted_reads, rejected_reads = assign_sequence_counts_to_amplicons(
+                sequence_count_map,
                 amplicons,
-                end_anchor_tolerance=args.end_anchor_tolerance,
-                min_overlap_fraction=args.min_overlap_fraction,
+                reference,
+                match_score=args.match_score,
+                mismatch_score=args.mismatch_score,
+                gap_open_score=args.gap_open_score,
+                gap_extend_score=args.gap_extend_score,
+                min_aligned_block=args.min_aligned_block,
+                min_reference_fraction=args.min_reference_fraction,
+                min_query_fraction=args.min_query_fraction,
+                max_indel_fraction=args.max_indel_fraction,
             )
-        finally:
-            bam.close()
+            min_output_copies = 1  # already filtered before FASTQ discovery/assignment
+            if accepted_reads == 0:
+                raise ValueError("No FASTQ sequences satisfy alignment criteria for any inferred amplicon")
+            if args.verbose:
+                retained_after_copy_filter = sum(sequence_count_map.values())
+                print(
+                    f"FASTQ reads: {raw_reads}; quality-passing: {quality_passing_reads}; "
+                    f"retained after copy filter: {retained_after_copy_filter}; "
+                    f"assigned: {accepted_reads}; rejected by amplicon alignment: {rejected_reads}",
+                    file=sys.stderr,
+                )
 
         all_calls: list[dict[str, str]] = []
         with tempfile.TemporaryDirectory(prefix="itdmapper_") as tmp:
             temp_root = Path(tmp)
-            for idx, (amplicon, amp_reads) in enumerate(zip(amplicons, read_groups), start=1):
-                if not amp_reads:
+            for idx, (amplicon, counts) in enumerate(zip(amplicons, read_groups), start=1):
+                if not counts:
                     continue
                 workdir = temp_root / f"amplicon_{idx}"
                 workdir.mkdir()
 
                 ref_seq = reference.extract_interval(amplicon.start, amplicon.end)
                 anno_rows = reference.annotation_rows(amplicon.start, amplicon.end)
-                counts = sequence_counts(amp_reads, reference.strand)
 
                 reference_txt = workdir / "reference.txt"
                 annotation_tsv = workdir / "annotation.tsv"
                 reads_tsv = workdir / "reads.tsv"
                 write_reference(reference_txt, ref_seq)
                 write_annotation(annotation_tsv, anno_rows)
-                write_sequence_counts(reads_tsv, counts, args.min_read_copies)
+                write_sequence_counts(reads_tsv, counts, min_output_copies)
 
                 if args.verbose:
                     print(
                         f"Inferred {contig}:{amplicon.start + 1}-{amplicon.end} "
-                        f"({amplicon.support} anchor reads; {len(amp_reads)} reads assigned)",
+                        f"({amplicon.support} discovery-support reads; "
+                        f"{sum(counts.values())} reads assigned)",
                         file=sys.stderr,
                     )
 
                 filtered = run_mergeitd(
                     runner=runner,
                     workdir=workdir,
-                    sample=args.bam.stem,
+                    sample=_sample_name(args.input),
                     reads_tsv=reads_tsv,
                     reference_txt=reference_txt,
                     annotation_tsv=annotation_tsv,
@@ -686,8 +1051,6 @@ def main() -> int:
             print("NO_FLT3_ITD")
             return 0
 
-        # Multiple inferred amplicons may independently observe the same call.
-        # Report the strongest observation for each HGVS string.
         best: dict[str, dict[str, str]] = {}
         for call in all_calls:
             key = call["HGVS"]

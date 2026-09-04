@@ -41,6 +41,9 @@ class TestSettings(unittest.TestCase):
         self.assertFalse(settings["reads"]["exclude_duplicates"])
         self.assertFalse(settings["reads"]["exclude_qcfail"])
         self.assertEqual(settings["reads"]["min_read_copies"], 2)
+        self.assertEqual(settings["fastq"]["discovery_top_unique"], 10)
+        self.assertEqual(settings["alignment"]["min_reference_fraction"], 0.4)
+        self.assertEqual(settings["alignment"]["min_query_fraction"], 0.3)
         self.assertEqual(settings["calling"]["min_vaf_percent"], 0.006)
 
     def test_custom_file_is_partial_and_cli_wins(self):
@@ -48,16 +51,20 @@ class TestSettings(unittest.TestCase):
             path = Path(tmp) / "custom.toml"
             path.write_text(
                 "[reads]\nmin_mapq = 25\nmin_read_copies = 3\n\n"
+                "[fastq]\ndiscovery_top_unique = 7\n\n"
                 "[calling]\nmin_vaf_percent = 0.05\n"
             )
             args = parse_args([
                 "sample.bam",
                 "--settings", str(path),
                 "--min-vaf", "0.2",
+                "--min-query-fraction", "0.6",
             ])
             args = resolve_args(args)
             self.assertEqual(args.min_mapq, 25)
             self.assertEqual(args.min_read_copies, 3)
+            self.assertEqual(args.fastq_discovery_top_unique, 7)
+            self.assertEqual(args.min_query_fraction, 0.6)
             self.assertEqual(args.min_vaf, 0.2)
             self.assertEqual(args.min_insert_seq_length, 6)
 

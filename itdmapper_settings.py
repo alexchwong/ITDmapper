@@ -30,6 +30,9 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Optional[float], Opt
         "end_anchor_tolerance": (int, 0, None),
         "min_overlap_fraction": ((int, float), 0, 1),
     },
+    "fastq": {
+        "discovery_top_unique": (int, 1, None),
+    },
     "alignment": {
         "match": ((int, float), None, None),
         "mismatch": ((int, float), None, None),
@@ -37,6 +40,7 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Optional[float], Opt
         "gap_extend": ((int, float), None, None),
         "min_aligned_block": (int, 1, None),
         "min_reference_fraction": ((int, float), 0, 1),
+        "min_query_fraction": ((int, float), 0, 1),
         "max_indel_fraction": ((int, float), 0, 1),
     },
     "calling": {
@@ -90,7 +94,6 @@ def _validate_known_keys(data: dict[str, Any], path: Path, require_all: bool) ->
 
         for key, value in values.items():
             expected_type, minimum, maximum = spec[key]
-            # bool is a subclass of int, so reject it for numeric settings.
             if expected_type is not bool and isinstance(value, bool):
                 valid_type = False
             else:
@@ -99,7 +102,12 @@ def _validate_known_keys(data: dict[str, Any], path: Path, require_all: bool) ->
                 raise ValueError(
                     f"Invalid type for [{section}].{key} in {path}: {type(value).__name__}"
                 )
-            if key in {"min_cluster_fraction", "min_overlap_fraction"} and value <= 0:
+            if key in {
+                "min_cluster_fraction",
+                "min_overlap_fraction",
+                "min_reference_fraction",
+                "min_query_fraction",
+            } and value <= 0:
                 raise ValueError(f"[{section}].{key} must be > 0 in {path}")
             if minimum is not None and value < minimum:
                 raise ValueError(f"[{section}].{key} must be >= {minimum} in {path}")
@@ -107,11 +115,10 @@ def _validate_known_keys(data: dict[str, Any], path: Path, require_all: bool) ->
                 raise ValueError(f"[{section}].{key} must be <= {maximum} in {path}")
 
 
-
-
 def validate_settings(data: dict[str, Any], source: str = "settings") -> None:
     """Validate a complete resolved settings dictionary."""
     _validate_known_keys(data, Path(source), require_all=True)
+
 
 def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = deepcopy(base)
