@@ -95,6 +95,41 @@ NO_FLT3_ITD
 
 Use `--verbose` to report inferred amplicons and assignment counts. FASTQ mode additionally reports raw reads, quality-passing reads, reads retained after the copy-number filter, and reads accepted/rejected by amplicon alignment.
 
+### Supporting-sequence FASTA export (BAM only)
+
+Add `--variant-fasta` to emit a FASTA for each final reported variant. For an input
+`/data/sample.bam`, outputs are `/data/sample_variant001.fasta`,
+`/data/sample_variant002.fasta`, etc., numbered in decreasing reported VAF order
+(the same order as the output table). No output-path option is needed.
+
+Each file contains one record per **unique full read sequence per original BAM
+alignment strand**, with positive-strand records first, then negative-strand
+records. Within each strand, records are sorted by decreasing count, with sequence
+text breaking ties. All sequences are normalized to common FLT3/transcript
+orientation; identical sequences supported on both strands therefore appear twice.
+Headers look like:
+
+```text
+>sequence001_count12_orientation+ HGVS=NM_004119.3:c.… sequence_orientation=transcript
+```
+
+`count12` means 12 original BAM records of that sequence and strand contributed
+to the variant assignment. `orientation+` / `orientation-` denotes the original
+genomic alignment strand, not the displayed sequence direction. Reads excluded
+by configured quality, amplicon-assignment, minimum-copy, or alignment filters
+are not included. Support is determined from the caller's existing assignments,
+not by insertion-substring matching or a new alignment.
+
+Support from contributing amplicons is combined by normalized HGVS, while the
+reported VAF/counts still come from the highest-VAF amplicon as before. Thus summed
+FASTA counts can exceed the table's selected-amplicon count. A sequence assigned
+to multiple reported variants can appear in each variant's file.
+
+Export is opt-in and does not change calls or tabular output. No files are generated
+for `NO_FLT3_ITD`. FASTQ input with this flag is rejected because it has no original
+BAM alignment strand. Reruns overwrite current variant files; older extra numbered
+files are not automatically deleted and should be removed before rerunning if needed.
+
 ## Settings and quality filters
 
 All runtime thresholds are defined in packaged `config/default.toml`. A custom TOML file can contain only values that need to change. Explicit CLI options override both the custom file and packaged defaults.

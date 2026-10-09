@@ -734,6 +734,71 @@ def write_reference(path: Path, sequence: str) -> None:
     path.write_text(sequence.upper() + "\n")
 
 
+def strand_sequence_counts(reads, strand: str) -> Counter[tuple[str, str]]:
+    """Count transcript-oriented BAM sequences by original alignment strand."""
+    counts: Counter[tuple[str, str]] = Counter()
+    for read in reads:
+        sequence = read.query_sequence.upper()
+        if strand == "-":
+            sequence = reverse_complement(sequence)
+        orientation = "-" if read.is_reverse else "+"
+        counts[(sequence, orientation)] += 1
+    return counts
+
+
+def collect_variant_sequences(
+    alignment_path: Path,
+    calls: list[dict[str, str]],
+    counts: Counter[tuple[str, str]],
+    variants: dict[str, Counter[tuple[str, str]]],
+) -> None:
+    """Join existing mergeITD assignments to accepted calls, without realigning."""
+    names: dict[str, set[str]] = {}
+    for call in calls:
+        names.setdefault(call["name"], set()).add(call["HGVS"])
+    with alignment_path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("Aligned", "").lower() != "true":
+                continue
+            hgvs_names = set()
+            for name in row.get("HGVS", "").split(";"):
+                hgvs_names.update(names.get(name, set()))
+            sequence = row["Sequence"].upper()
+            for hgvs in hgvs_names:
+                support = variants.setdefault(hgvs, Counter())
+                for orientation in ("+", "-"):
+                    count = counts[(sequence, orientation)]
+                    if count:
+                        support[(sequence, orientation)] += count
+
+
+def write_variant_fastas(
+    bam_path: Path,
+    calls: list[dict[str, str]],
+    variants: dict[str, Counter[tuple[str, str]]],
+) -> list[Path]:
+    """Write one FASTA per call, in the supplied final VAF-ranked order."""
+    paths = []
+    for number, call in enumerate(calls, start=1):
+        support = variants.get(call["HGVS"], Counter())
+        if not support:
+            raise ValueError(f"No supporting sequences found for {call['HGVS']}")
+        path = bam_path.parent / f"{_sample_name(bam_path)}_variant{number:03d}.fasta"
+        records = sorted(
+            support.items(),
+            key=lambda item: (item[0][1] == "-", -item[1], item[0][0]),
+        )
+        with path.open("w") as handle:
+            for index, ((sequence, orientation), count) in enumerate(records, start=1):
+                handle.write(
+                    f">sequence{index:03d}_count{count}_orientation{orientation} "
+                    f"HGVS={call['HGVS']} sequence_orientation=transcript\n"
+                )
+                handle.write(sequence + "\n")
+        paths.append(path)
+    return paths
+
+
 def write_annotation(path: Path, rows: list[dict[str, object]]) -> None:
     fieldnames = ["amplicon_bp", "region", "chr13_bp", "transcript_bp", "protein_as"]
     with path.open("w", newline="") as handle:
@@ -917,6 +982,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-total-reads", type=int, default=None)
     parser.add_argument("--min-vaf", type=float, default=None, help="VAF percent, matching mergeITD")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--variant-fasta", action="store_true",
+        help="export unique supporting sequences per BAM strand beside the BAM",
+    )
     return parser.parse_args(argv)
 
 
@@ -972,6 +1041,8 @@ def main() -> int:
     try:
         args = resolve_args(args)
         input_format = detect_input_format(args.input, args.input_format)
+        if args.variant_fasta and input_format != "bam":
+            raise ValueError("--variant-fasta requires BAM input (original alignment strands)")
         reference = Flt3Reference.load(args.flt3_reference)
         target_start0, target_end0 = reference.target_fetch_interval()
         contig = reference.chrom
@@ -1061,6 +1132,7 @@ def main() -> int:
                 )
 
         all_calls: list[dict[str, str]] = []
+        variant_sequences: dict[str, Counter[tuple[str, str]]] = {}
         with tempfile.TemporaryDirectory(prefix="itdmapper_") as tmp:
             temp_root = Path(tmp)
             for idx, (amplicon, counts) in enumerate(zip(amplicons, read_groups), start=1):
@@ -1105,7 +1177,15 @@ def main() -> int:
                     min_reference_fraction=args.min_reference_fraction,
                     max_indel_fraction=args.max_indel_fraction,
                 )
-                all_calls.extend(read_calls(filtered, amplicon, contig, reference))
+                calls = read_calls(filtered, amplicon, contig, reference)
+                all_calls.extend(calls)
+                if args.variant_fasta and calls:
+                    collect_variant_sequences(
+                        filtered.parent / "alignClasses.csv",
+                        calls,
+                        strand_sequence_counts(bam_groups[idx - 1], reference.strand),
+                        variant_sequences,
+                    )
 
         if not all_calls:
             print("NO_FLT3_ITD")
@@ -1117,8 +1197,15 @@ def main() -> int:
             if key not in best or float(call["vaf_percent"]) > float(best[key]["vaf_percent"]):
                 best[key] = call
 
+        ranked_calls = sorted(best.values(), key=lambda row: float(row["vaf_percent"]), reverse=True)
+        if args.variant_fasta:
+            paths = write_variant_fastas(args.input, ranked_calls, variant_sequences)
+            if args.verbose:
+                for path in paths:
+                    print(f"Variant FASTA: {path}", file=sys.stderr)
+
         print("HGVS\tnetInsert\tcounts\tvaf_percent\tcoverage\tamplicon")
-        for call in sorted(best.values(), key=lambda row: float(row["vaf_percent"]), reverse=True):
+        for call in ranked_calls:
             print(
                 "\t".join(
                     [
