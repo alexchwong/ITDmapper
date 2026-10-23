@@ -50,3 +50,12 @@ min_insert_length = 6
 min_supporting_reads = 1
 # Percent, matching mergeITD semantics (0.006 means 0.006%).
 min_vaf_percent = 0.006
+
+[reassignment]
+# Optional closed-list WT/ITD competition; existing calling is unchanged when false.
+enabled = false
+mode = "balanced"
+min_score_margin = 10.0
+min_query_fraction = 0.8
+max_error_fraction = 0.15
+min_anchor = 3

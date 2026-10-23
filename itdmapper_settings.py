@@ -15,6 +15,14 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 PACKAGED_SETTINGS_PATH = Path(__file__).resolve().parent / "config" / "default.toml"
 
 _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Optional[float], Optional[float]]]] = {
+    "reassignment": {
+        "enabled": (bool, None, None),
+        "mode": (str, None, None),
+        "min_score_margin": ((int, float), 0, None),
+        "min_query_fraction": ((int, float), 0, 1),
+        "max_error_fraction": ((int, float), 0, 1),
+        "min_anchor": (int, 1, None),
+    },
     "reads": {
         "min_mapq": (int, 0, None),
         "min_mean_base_quality": ((int, float), 0, None),
@@ -93,6 +101,8 @@ def _validate_known_keys(data: dict[str, Any], path: Path, require_all: bool) ->
                 )
 
         for key, value in values.items():
+            if section == "reassignment" and key == "mode" and value not in {"lenient", "balanced", "strict"}:
+                raise ValueError(f"Invalid [reassignment].mode in {path}: {value!r}")
             expected_type, minimum, maximum = spec[key]
             if expected_type is not bool and isinstance(value, bool):
                 valid_type = False

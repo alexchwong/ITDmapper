@@ -178,6 +178,134 @@ older extra numbered files are not automatically deleted.
 
 ## Settings and quality filters
 
+### Optional closed-list reassignment and VAF recalculation
+
+The default caller is unchanged. Add `--recalculate-vaf` to separate discovery
+from quantification: discover ITD candidates using the existing mergeITD core,
+freeze their normalized sequence edits, then compete each eligible unique full
+sequence against WT and every compatible reconstructed ITD amplicon using
+Biopython `PairwiseAligner`. This is supported for BAM and FASTQ. It does not
+discover new variants in the second pass or accept an external allele list.
+
+```bash
+python itdmapper.py sample.bam --settings config/torrent.toml --recalculate-vaf --verbose
+```
+
+Quality/copy-filtered sequences are retained **before** WT-based alignment or
+amplicon-assignment rejection, allowing reads rejected during discovery to be
+rescued. BAM sequences include soft-clipped bases, but unmapped/unfetched reads
+and hard-clipped bases cannot be recovered. BAM copy filtering for this pass is
+across the fetched pool, before strand separation. FASTQ tests both orientations.
+Alignments are reused for identical sequences observed on both BAM strands.
+
+### Recount strictness modes
+
+Use `--variant-alignments=lenient`, `--variant-alignments=balanced`, or
+`--variant-alignments=strict` to enable recounting and BAM alignment reports.
+The bare `--variant-alignments` (or `=report`) still only requests reports and
+never enables recounting by itself. For recount without reports, including FASTQ,
+use `--recalculate-vaf --recount-mode balanced`. Balanced is the packaged recount
+default; custom TOML can select another mode.
+Conflicting explicit modes or disabling recount with a counting-valued report
+flag are errors.
+
+These are **two interfaces to the same policy**, not separate stringency settings:
+
+```bash
+# Equivalent: both recount in balanced mode and export BAM TXT reports.
+python itdmapper.py sample.bam --variant-alignments=balanced
+python itdmapper.py sample.bam --recalculate-vaf --recount-mode balanced --variant-alignments
+```
+
+Prefer the second spelling in scripts to separate analysis from output generation.
+Omit `--variant-alignments` to recount without TXT reports. Bare
+`--variant-alignments`/`=report` does not enable or disable recounting; it exports
+the independently selected calls. Use `--no-recalculate-vaf --variant-alignments`
+to explicitly request legacy calls and reports even when TOML enables recount.
+`--recalculate-vaf` is boolean: `--recalculate-vaf=balanced` is **not implemented**.
+The detailed CLI equivalence table and conflict rules are in
+`docs/alignment-and-recount.md`, under “Why are there two ways to select stringency?”.
+
+| Mode | Coverage policy |
+|---|---|
+| lenient | Preserve accepted baseline site coverage if an alternative passes permissive QC; allow justified rescue |
+| balanced | Require moderate QC and realigned site coverage; retain adequately aligned ambiguous reads |
+| strict | Require stringent QC, confident allele assignment, and exact flank anchors |
+
+No mode forces reads into an allele when all alternatives fit poorly. Coverage
+and confident allele assignment are separate in lenient/balanced modes. Exact
+score ties remain unresolved, but do not automatically erase site coverage.
+A mismatch may count toward aligned site coverage without being an exact support
+anchor. Mode-specific numerical thresholds are provisional, not assay-calibrated.
+
+```text
+coverage = baseline_coverage - lost_coverage + rescued_coverage
+VAF = 100 × confidently assigned candidate fragments / coverage
+```
+
+Unresolved candidate-compatible support and an assignment upper bound are audited
+separately. Strict exclusion can increase VAF through denominator shrinkage;
+lenient/balanced confident-support fractions can undercount unresolved support.
+The highest-VAF amplicon is still reported. Recount FASTA/TXT exports use its
+confident support only, agreeing with the table.
+
+Recount normally preserves the original amplicon assignment, but permits a
+confident **boundary rescue** into a longer containing amplicon if the original
+inferred interval truncates an ITD or its required flanks. The read must pass
+mode-specific QC/anchors and beat the original alignment and other alleles by the
+score margin; WT/tied/poor alignments are not forced into another amplicon.
+Audits retain the original amplicon, label the transfer, and account for coverage
+at the source and destination without counting a fragment twice per candidate.
+Call summaries expose `boundary_rescued_support`. Full rules are in the guide's
+“Candidate-truncating amplicon boundaries” section.
+
+Full scoring, terminal-gap behavior, mode thresholds, coordinate conventions,
+coverage rules, CLI/TOML precedence, examples and limitations are documented in
+`docs/alignment-and-recount.md`.
+
+Candidate discovery retains net insertions meeting `min_insert_length` before
+the final supporting-read/VAF thresholds. Those final thresholds are reapplied
+after reassignment. Single-read candidate artifacts can therefore participate in
+competition but still fail reporting. Candidate completeness, similarity and the
+alignment thresholds affect results; a closed-list assignment is not evidence
+that an unknown allele does not exist. Multi-ITD haplotypes are not modeled.
+
+Three TSV audit files are written, including when no ITD passes final reporting:
+
+- `<sample>_reassignment.tsv`: full input/oriented sequences, original BAM strand
+  (`?` for FASTQ), counts, status/reason, winning/runner-up allele scores, margin,
+  selected amplicon, query fraction and internal error fraction.
+- `<sample>_reassignment_coverage.tsv`: candidate-specific baseline membership,
+  coverage inclusion/exclusion reasons, support and unresolved flags.
+- `<sample>_reassignment_calls.tsv`: discovery versus recalculated counts/VAF,
+  coverage, baseline/lost/rescued coverage, unresolved support, mode and reporting status.
+
+Use `--reassignment-audit /absolute/path/audit.tsv` to relocate all three files; its
+companions are `audit_calls.tsv` and `audit_coverage.tsv`. The parent directory must exist. Existing audit
+files at those paths are overwritten. Without recalculation, neither is written.
+
+Custom TOML overrides (these are provisional, conservative defaults, not
+assay-calibrated thresholds):
+
+```toml
+[reassignment]
+enabled = true
+mode = "balanced"
+# Optional overrides; otherwise the selected mode preset applies.
+min_score_margin = 10.0
+min_query_fraction = 0.8
+max_error_fraction = 0.15
+min_anchor = 3
+```
+
+CLI overrides are `--reassignment-min-score-margin`,
+`--reassignment-min-query-fraction`, `--reassignment-max-error-fraction`, and
+`--reassignment-min-anchor`. `--no-recalculate-vaf` overrides TOML enablement.
+The score margin is an alignment-score difference, not a probability or MAPQ.
+Internal error fraction counts mismatches and internal gap bases; unaligned ends
+are controlled separately by query coverage. Off-target reads with no informative
+variant flank coverage are not treated as WT evidence.
+
 All runtime thresholds are defined in packaged `config/default.toml`. A custom TOML file can contain only values that need to change. Explicit CLI options override both the custom file and packaged defaults.
 
 ### Packaged defaults

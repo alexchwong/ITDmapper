@@ -22,6 +22,7 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
 from hgvs_normalize import normalize_mergeitd_name
+from allele_reassignment import build_references, recount_sequences, RECOUNT_PRESETS
 from itdmapper_settings import load_settings, validate_settings
 
 try:
@@ -854,6 +855,7 @@ def write_variant_alignments(
     variants: dict[str, Counter[tuple[str, str]]],
     provenance: VariantAmplicons,
     aligner,
+    recount_mode: Optional[str] = None,
 ) -> list[Path]:
     """Render supporting reads against assigned mutant amplicons with Biopython."""
     paths = []
@@ -869,6 +871,8 @@ def write_variant_alignments(
                 raise ValueError(f"Incomplete mutant reference provenance for {record.id} ({hgvs})")
         path = bam_path.parent / f"{_sample_name(bam_path)}_variant{number:03d}_alignments.txt"
         with path.open("w") as handle:
+            if recount_mode is not None:
+                handle.write(f"recount_mode={recount_mode} support=confident selected_amplicon={call['amplicon']}\n\n")
             for key, record in records:
                 handle.write(f"{record.id}\n{record.description}\n")
                 for (label, reference), count in sorted(sources_by_sequence[key].items()):
@@ -951,6 +955,7 @@ def read_calls(
     amplicon: Amplicon,
     contig: str,
     reference: Flt3Reference,
+    min_net_insert: Optional[int] = None,
 ) -> list[dict[str, str]]:
     calls = []
     amplicon_reference = reference.extract_interval(amplicon.start, amplicon.end).upper()
@@ -959,6 +964,8 @@ def read_calls(
 
     with path.open(newline="") as handle:
         for row in csv.DictReader(handle):
+            if min_net_insert is not None and int(row["netInsert"]) < min_net_insert:
+                continue
             if not row.get("HGVS", ""):
                 continue
             mutation_name = row.get("name", "")
@@ -1003,7 +1010,127 @@ def _add_bool_override(
     )
 
 
+def recalculate_calls(args, amplicons, reference, contig, all_calls, counts, both_orientations, baseline):
+    """Freeze discovery candidates, compete full reads, and retain best-VAF amplicon.
+
+    The legacy mergeITD core is untouched. Coverage and assignment confidence
+    follow the selected recount policy and are audited separately.
+    """
+    templates = {}
+    candidates = {}
+    amp_refs = []
+    for amp in amplicons:
+        wt = reference.extract_interval(amp.start, amp.end).upper()
+        first = amp.end if reference.strand == "-" else amp.start + 1
+        offset = reference.sequence_index_for_genomic_pos(first)
+        label = f"{contig}:{amp.label}"
+        amp_refs.append((label, wt, offset))
+        for call in all_calls:
+            if call["amplicon"] != label:
+                continue
+            normalized = normalize_mergeitd_name(call["name"], wt, reference.sequence,
+                                                 offset, reference.hgvs_coord_for_index)
+            name = call["HGVS"]
+            candidates[name] = normalized.edit
+            if name not in templates or float(call["vaf_percent"]) > float(templates[name]["vaf_percent"]):
+                templates[name] = call
+    references = build_references(amp_refs, candidates)
+    aligner = _make_aligner(args.match_score, args.mismatch_score,
+                            args.gap_open_score, args.gap_extend_score)
+    audit, coverage_audit, assignments = recount_sequences(
+        counts, references, candidates, aligner, baseline, mode=args.recount_mode,
+        min_score_margin=args.reassignment_min_score_margin,
+        min_query_fraction=args.reassignment_min_query_fraction,
+        max_error_fraction=args.reassignment_max_error_fraction,
+        min_anchor=args.reassignment_min_anchor, both_orientations=both_orientations,
+    )
+    audit_path = args.reassignment_audit or args.input.parent / f"{_sample_name(args.input)}_reassignment.tsv"
+    audit_fields = ["sequence", "oriented_sequence", "strand", "count", "status", "reason",
+                    "allele", "amplicon", "score", "runner_up_allele", "runner_up_score",
+                    "score_margin", "query_fraction", "error_fraction", "mode", "original_amplicon",
+                    "amplicon_boundary_rescue"]
+    with audit_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=audit_fields, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(audit)
+    coverage_path = audit_path.with_name(audit_path.stem + "_coverage.tsv")
+    with coverage_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sequence", "strand", "count", "amplicon", "HGVS",
+            "mode", "baseline_covered", "coverage_eligible", "coverage_reason", "supporting", "unresolved",
+            "original_amplicon", "amplicon_boundary_rescue"],
+            delimiter="\t")
+        writer.writeheader()
+        writer.writerows(coverage_audit)
+    recalculated = []
+    summaries = []
+    variants = {}
+    provenance = {}
+    for name, edit in candidates.items():
+        choices = []
+        for label, wt, offset in amp_refs:
+            if not any(r.name == name and r.amplicon == label for r in references):
+                continue
+            group = [item for item in assignments if item[0].reference.amplicon == label]
+            evidence = [row for row in coverage_audit if row["HGVS"] == name and row["amplicon"] == label]
+            n = sum(row["count"] for row in evidence if row["supporting"])
+            depth = sum(row["count"] for row in evidence if row["coverage_eligible"])
+            initial = sum(row["count"] for row in evidence if row["baseline_covered"])
+            lost = sum(row["count"] for row in evidence if row["baseline_covered"] and not row["coverage_eligible"])
+            rescued = sum(row["count"] for row in evidence if not row["baseline_covered"] and row["coverage_eligible"])
+            unresolved = sum(row["count"] for row in evidence if row["unresolved"])
+            assert depth == initial - lost + rescued
+            vaf = 100 * n / depth if depth else 0.0
+            choices.append((vaf, n, depth, label, group, initial, lost, rescued, unresolved))
+        if not choices:
+            continue
+        vaf, n, depth, label, group, initial, lost, rescued, unresolved = max(choices, key=lambda item: item[:4])
+        template = templates[name]
+        passed = n >= args.min_total_reads and n > 0 and vaf >= args.min_vaf
+        summaries.append(dict(HGVS=name, discovery_counts=template["counts"],
+                              discovery_vaf_percent=template["vaf_percent"],
+                              discovery_amplicon=template["amplicon"], counts=n,
+                              coverage=depth, vaf_percent=vaf, amplicon=label, reported=passed,
+                              mode=args.recount_mode, discovery_coverage=template["coverage"],
+                              baseline_coverage=initial, lost_coverage=lost, rescued_coverage=rescued,
+                              unresolved_support=unresolved,
+                              boundary_rescued_support=sum(row["count"] for row in evidence
+                                  if row["supporting"] and row["amplicon_boundary_rescue"]),
+                              assignment_upper_vaf_percent=100 * (n + unresolved) / depth if depth else 0))
+        if not passed:
+            continue
+        call = dict(template, counts=str(n), coverage=str(depth), vaf_percent=str(vaf), amplicon=label)
+        recalculated.append(call)
+        for match, strand, count in group:
+            if match.reference.name != name:
+                continue
+            key = (match.sequence, strand)
+            variants.setdefault(name, Counter())[key] += count
+            provenance.setdefault(name, {}).setdefault(key, Counter())[(label, match.reference.sequence)] += count
+    summary_path = audit_path.with_name(audit_path.stem + "_calls.tsv")
+    with summary_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["HGVS", "discovery_counts", "discovery_vaf_percent",
+                                "discovery_amplicon", "counts", "coverage", "vaf_percent", "amplicon",
+                                "reported", "mode", "discovery_coverage", "baseline_coverage", "lost_coverage",
+                                "rescued_coverage", "unresolved_support", "assignment_upper_vaf_percent",
+                                "boundary_rescued_support"], delimiter="\t")
+        writer.writeheader()
+        writer.writerows(summaries)
+    if args.verbose:
+        statuses = Counter()
+        for row in audit:
+            statuses[row["status"]] += row["count"]
+        print(f"Reassignment: {len(candidates)} candidates; {dict(statuses)}; audit: {audit_path}", file=sys.stderr)
+    return recalculated, variants, provenance
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    # Preserve the historical bare flag before a positional filename: argparse's
+    # optional nargs would otherwise consume that filename as a mode.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    modes = {"report", *RECOUNT_PRESETS}
+    argv = ["--variant-alignments=report" if token == "--variant-alignments" and
+            (idx + 1 == len(argv) or argv[idx + 1] not in modes) else token
+            for idx, token in enumerate(argv)]
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description="Call FLT3 insertions from already-BBmerged BAM or FASTQ fragments."
@@ -1067,20 +1194,62 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-total-reads", type=int, default=None)
     parser.add_argument("--min-vaf", type=float, default=None, help="VAF percent, matching mergeITD")
     parser.add_argument("--verbose", action="store_true")
+    _add_bool_override(parser, "recalculate-vaf", "recalculate_vaf",
+                       "Reassign full reads against WT and discovered ITD alleles",
+                       "Keep legacy assignments and VAF")
+    parser.add_argument("--reassignment-min-score-margin", type=float, default=None)
+    parser.add_argument("--reassignment-min-query-fraction", type=float, default=None)
+    parser.add_argument("--reassignment-max-error-fraction", type=float, default=None)
+    parser.add_argument("--reassignment-min-anchor", type=int, default=None)
+    parser.add_argument("--recount-mode", choices=tuple(RECOUNT_PRESETS), default=None,
+                        help="recount coverage/assignment policy (default: balanced); requires recounting")
+    parser.add_argument("--reassignment-audit", type=Path, default=None,
+                        help="audit TSV path (default: beside input); requires --recalculate-vaf")
     parser.add_argument(
         "--variant-fasta", action="store_true",
         help="export unique supporting sequences per BAM strand beside the BAM",
     )
     parser.add_argument(
-        "--variant-alignments", action="store_true",
-        help="export supporting-sequence alignments to assigned FLT3-ITD references beside the BAM",
+        "--variant-alignments", nargs="?", const="report", default=False,
+        choices=("report", *RECOUNT_PRESETS),
+        help="export BAM alignment reports; optional =lenient|balanced|strict also enables recounting",
     )
     return parser.parse_args(argv)
 
 
 def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     settings = load_settings(args.settings)
+    report_mode = args.variant_alignments if args.variant_alignments in RECOUNT_PRESETS else None
+    if report_mode:
+        if args.recalculate_vaf is False:
+            raise ValueError("--variant-alignments counting mode conflicts with --no-recalculate-vaf")
+        if args.recount_mode is not None and args.recount_mode != report_mode:
+            raise ValueError("Conflicting --variant-alignments and --recount-mode values")
+        args.recalculate_vaf = True
+        args.recount_mode = report_mode
+    explicit_mode = args.recount_mode is not None
+    mode = args.recount_mode or settings["reassignment"]["mode"]
+    # Mode presets replace packaged thresholds; custom TOML/CLI values override them.
+    if args.settings:
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
+        with args.settings.open("rb") as handle:
+            custom_keys = tomllib.load(handle).get("reassignment", {})
+    else:
+        custom_keys = {}
+    for key, value in zip(("min_query_fraction", "max_error_fraction", "min_anchor", "min_score_margin"),
+                          RECOUNT_PRESETS[mode]):
+        if key not in custom_keys:
+            settings["reassignment"][key] = value
     mappings = {
+        "recount_mode": ("reassignment", "mode"),
+        "recalculate_vaf": ("reassignment", "enabled"),
+        "reassignment_min_score_margin": ("reassignment", "min_score_margin"),
+        "reassignment_min_query_fraction": ("reassignment", "min_query_fraction"),
+        "reassignment_max_error_fraction": ("reassignment", "max_error_fraction"),
+        "reassignment_min_anchor": ("reassignment", "min_anchor"),
         "min_mapq": ("reads", "min_mapq"),
         "min_mean_base_quality": ("reads", "min_mean_base_quality"),
         "exclude_duplicates": ("reads", "exclude_duplicates"),
@@ -1111,6 +1280,21 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
             setattr(args, attr, settings[section][key])
         effective[section][key] = getattr(args, attr)
     validate_settings(effective, source="CLI/settings")
+    if explicit_mode and not args.recalculate_vaf:
+        raise ValueError("--recount-mode requires --recalculate-vaf")
+    if args.reassignment_audit is not None and not args.recalculate_vaf:
+        raise ValueError("--reassignment-audit requires --recalculate-vaf")
+    if args.recalculate_vaf:
+        audit = args.reassignment_audit or args.input.parent / f"{_sample_name(args.input)}_reassignment.tsv"
+        summary = audit.with_name(audit.stem + "_calls.tsv")
+        coverage = audit.with_name(audit.stem + "_coverage.tsv")
+        protected = {args.input.resolve(), args.flt3_reference.resolve()}
+        if args.settings is not None:
+            protected.add(args.settings.resolve())
+        if any(path.resolve() in protected for path in (audit, summary, coverage)):
+            raise ValueError("Reassignment audit paths must not overwrite input, reference or settings")
+        if audit.resolve() == summary.resolve():
+            raise ValueError("Reassignment audit and summary paths must be distinct")
     return args
 
 
@@ -1172,6 +1356,11 @@ def main() -> int:
                 )
                 read_groups = [sequence_counts(group, reference.strand) for group in bam_groups]
                 min_output_copies = args.min_read_copies
+                if args.recalculate_vaf:
+                    pooled = sequence_counts(reads, reference.strand)
+                    reassignment_counts = Counter({key: n for key, n in
+                        strand_sequence_counts(reads, reference.strand).items()
+                        if pooled[key[0]] >= args.min_read_copies})
             finally:
                 bam.close()
         else:
@@ -1180,6 +1369,8 @@ def main() -> int:
                 min_mean_base_quality=args.min_mean_base_quality,
                 min_read_copies=args.min_read_copies,
             )
+            if args.recalculate_vaf:
+                reassignment_counts = Counter({(seq, "?"): n for seq, n in sequence_count_map.items()})
             amplicons = discover_amplicons_from_sequences(
                 sequence_count_map,
                 reference,
@@ -1225,6 +1416,24 @@ def main() -> int:
         all_calls: list[dict[str, str]] = []
         variant_sequences: dict[str, Counter[tuple[str, str]]] = {}
         variant_amplicons: VariantAmplicons = {}
+        baseline = {}
+        recount_buckets = Counter()
+        if args.recalculate_vaf:
+            remaining = Counter(reassignment_counts)
+            for idx, amp in enumerate(amplicons):
+                label = f"{contig}:{amp.label}"
+                if input_format == "bam":
+                    group_counts = strand_sequence_counts(bam_groups[idx], reference.strand)
+                else:
+                    group_counts = Counter({(seq, "?"): n for seq, n in read_groups[idx].items()})
+                for (seq, strand), count in group_counts.items():
+                    n = min(count, remaining[(seq, strand)])
+                    if n:
+                        recount_buckets[(seq, strand, label)] += n
+                        remaining[(seq, strand)] -= n
+            for (seq, strand), count in remaining.items():
+                if count:
+                    recount_buckets[(seq, strand, "")] += count
         with tempfile.TemporaryDirectory(prefix="itdmapper_") as tmp:
             temp_root = Path(tmp)
             for idx, (amplicon, counts) in enumerate(zip(amplicons, read_groups), start=1):
@@ -1259,8 +1468,8 @@ def main() -> int:
                     reference_txt=reference_txt,
                     annotation_tsv=annotation_tsv,
                     min_insert_seq_length=args.min_insert_seq_length,
-                    min_total_reads=args.min_total_reads,
-                    min_vaf=args.min_vaf,
+                    min_total_reads=1 if args.recalculate_vaf else args.min_total_reads,
+                    min_vaf=0 if args.recalculate_vaf else args.min_vaf,
                     match_score=args.match_score,
                     mismatch_score=args.mismatch_score,
                     gap_open_score=args.gap_open_score,
@@ -1269,9 +1478,22 @@ def main() -> int:
                     min_reference_fraction=args.min_reference_fraction,
                     max_indel_fraction=args.max_indel_fraction,
                 )
-                calls = read_calls(filtered, amplicon, contig, reference)
+                calls = read_calls(
+                    filtered.parent / "mutation_vaf.csv" if args.recalculate_vaf else filtered,
+                    amplicon, contig, reference,
+                    min_net_insert=args.min_insert_seq_length if args.recalculate_vaf else None,
+                )
                 all_calls.extend(calls)
-                if (args.variant_fasta or args.variant_alignments) and calls:
+                if args.recalculate_vaf:
+                    first = amplicon.end if reference.strand == "-" else amplicon.start + 1
+                    offset = reference.sequence_index_for_genomic_pos(first)
+                    label = f"{contig}:{amplicon.label}"
+                    with (filtered.parent / "alignClasses.csv").open(newline="") as handle:
+                        for row in csv.DictReader(handle):
+                            if row.get("Aligned", "").lower() == "true":
+                                start, end = map(int, row["alignRefCoords"].split("-"))
+                                baseline[(label, row["Sequence"].upper())] = (offset + start, offset + end)
+                if not args.recalculate_vaf and (args.variant_fasta or args.variant_alignments) and calls:
                     collect_variant_sequences(
                         filtered.parent / "alignClasses.csv",
                         calls,
@@ -1284,6 +1506,12 @@ def main() -> int:
                             f"{contig}:{amplicon.label}",
                         ) if args.variant_alignments else None,
                     )
+
+        if args.recalculate_vaf:
+            all_calls, variant_sequences, variant_amplicons = recalculate_calls(
+                args, amplicons, reference, contig, all_calls, recount_buckets,
+                both_orientations=input_format == "fastq", baseline=baseline,
+            )
 
         if not all_calls:
             print("NO_FLT3_ITD")
@@ -1309,6 +1537,7 @@ def main() -> int:
                     args.match_score, args.mismatch_score,
                     args.gap_open_score, args.gap_extend_score,
                 ),
+                recount_mode=args.recount_mode if args.recalculate_vaf else None,
             )
             if args.verbose:
                 for path in paths:
