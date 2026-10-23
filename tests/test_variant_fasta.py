@@ -11,7 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 from itdmapper import (
+    _make_aligner,
     Flt3Reference,
     collect_variant_sequences,
     parse_args,
@@ -120,9 +123,23 @@ class TestVariantFasta(unittest.TestCase):
             baseline = subprocess.run(command, capture_output=True, text=True, timeout=120)
             self.assertEqual(baseline.returncode, 0, baseline.stderr)
             self.assertEqual(list(Path(tmp).glob("*.fasta")), [])
+            self.assertEqual(list(Path(tmp).glob("*_alignments.txt")), [])
+            txt_only = subprocess.run(command + ["--variant-alignments"], capture_output=True,
+                                      text=True, timeout=120)
+            self.assertEqual(txt_only.returncode, 0, txt_only.stderr)
+            self.assertEqual(txt_only.stdout, baseline.stdout)
+            self.assertEqual(list(Path(tmp).glob("*.fasta")), [])
+            self.assertEqual(len(list(Path(tmp).glob("*_alignments.txt"))), 2)
+            for path in Path(tmp).glob("*_alignments.txt"):
+                path.unlink()
             result = subprocess.run(command + ["--variant-fasta"], capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, baseline.stdout)
+            self.assertEqual(list(Path(tmp).glob("*_alignments.txt")), [])
+            combined = subprocess.run(command + ["--variant-fasta", "--variant-alignments"],
+                                      capture_output=True, text=True, timeout=120)
+            self.assertEqual(combined.returncode, 0, combined.stderr)
+            self.assertEqual(combined.stdout, baseline.stdout)
             calls = list(csv.DictReader(result.stdout.splitlines(), delimiter="\t"))
             self.assertEqual(len(calls), 2, result.stdout)
             self.assertGreater(float(calls[0]["vaf_percent"]), float(calls[1]["vaf_percent"]))
@@ -136,6 +153,36 @@ class TestVariantFasta(unittest.TestCase):
                 self.assertIn(f"count{expected[seq] // 2}_orientation+", records[0].id)
                 self.assertIn(f"count{expected[seq] // 2}_orientation-", records[1].id)
                 self.assertIn(f"HGVS={call['HGVS']}", records[0].description)
+                text = (Path(tmp) / f"synthetic_variant{number:03d}_alignments.txt").read_text()
+                self.assertEqual([line for line in text.splitlines() if line.startswith("sequence")],
+                                 [record.id for record in records])
+                expected_alignment = str(_make_aligner(5, -15, -36, -0.5).align(
+                    SeqRecord(Seq(seq), id="read"), SeqRecord(Seq(seq), id="reference"),
+                )[-1])
+                self.assertIn(expected_alignment, text)
+                wt_alignment = str(_make_aligner(5, -15, -36, -0.5).align(
+                    SeqRecord(Seq(seq), id="read"), SeqRecord(Seq(wt), id="reference"),
+                )[-1])
+                self.assertNotIn(wt_alignment, text)
+                self.assertIn("reference_type=FLT3-ITD", text)
+                self.assertIn(f"amplicon={reference.chrom}:{start + 1}-{end}", text)
+
+            # WT-only BAM exercises the no-call export path.
+            wt_bam = Path(tmp) / "wt.bam"
+            with pysam.AlignmentFile(str(bam), "rb") as source:
+                with pysam.AlignmentFile(str(wt_bam), "wb", header=header) as target:
+                    for read in source:
+                        if read.query_name.startswith("group0_"):
+                            target.write(read)
+            pysam.index(str(wt_bam))
+            no_calls = subprocess.run(
+                [sys.executable, str(ROOT / "itdmapper.py"), str(wt_bam),
+                 "--variant-fasta", "--variant-alignments"],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(no_calls.returncode, 0, no_calls.stderr)
+            self.assertEqual(no_calls.stdout.strip(), "NO_FLT3_ITD")
+            self.assertEqual(list(Path(tmp).glob("wt_variant*")), [])
 
 
 if __name__ == "__main__":

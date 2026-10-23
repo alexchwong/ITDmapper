@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from Bio import Align, SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
 from hgvs_normalize import normalize_mergeitd_name
 from itdmapper_settings import load_settings, validate_settings
@@ -41,6 +43,9 @@ DEFAULT_MIN_MAPQ = int(_PACKAGED_SETTINGS["reads"]["min_mapq"])
 DEFAULT_MIN_MEAN_BASE_QUALITY = float(_PACKAGED_SETTINGS["reads"]["min_mean_base_quality"])
 DEFAULT_EXCLUDE_DUPLICATES = bool(_PACKAGED_SETTINGS["reads"]["exclude_duplicates"])
 DEFAULT_EXCLUDE_QCFAIL = bool(_PACKAGED_SETTINGS["reads"]["exclude_qcfail"])
+
+# HGVS -> (sequence, original strand) -> (amplicon label, mutant reference) -> count.
+VariantAmplicons = dict[str, dict[tuple[str, str], Counter[tuple[str, str]]]]
 
 
 @dataclass(frozen=True)
@@ -746,13 +751,36 @@ def strand_sequence_counts(reads, strand: str) -> Counter[tuple[str, str]]:
     return counts
 
 
+def read_variant_references(
+    filtered_path: Path,
+    amplicon_fasta: Path,
+    amplicon_label: str,
+) -> dict[str, tuple[str, str]]:
+    """Join raw mutation names to mergeITD's emitted mutant amplicon references."""
+    with filtered_path.open(newline="") as handle:
+        mutations = list(csv.DictReader(handle))
+    with amplicon_fasta.open() as handle:
+        references = SeqIO.to_dict(SeqIO.parse(handle, "fasta"))
+    result = {}
+    for index, mutation in enumerate(mutations):
+        record = references.get(f"mutation_{index}")
+        if record is None or not record.seq:
+            raise ValueError(f"Missing mutant reference for {mutation['name']} in {amplicon_fasta}")
+        result[mutation["name"]] = (amplicon_label, str(record.seq).upper())
+    return result
+
+
 def collect_variant_sequences(
     alignment_path: Path,
     calls: list[dict[str, str]],
     counts: Counter[tuple[str, str]],
     variants: dict[str, Counter[tuple[str, str]]],
+    provenance: Optional[VariantAmplicons] = None,
+    mutant_references: Optional[dict[str, tuple[str, str]]] = None,
 ) -> None:
     """Join existing mergeITD assignments to accepted calls, without realigning."""
+    if provenance is not None and mutant_references is None:
+        raise ValueError("Mutant references are required when collecting provenance")
     names: dict[str, set[str]] = {}
     for call in calls:
         names.setdefault(call["name"], set()).add(call["HGVS"])
@@ -760,9 +788,10 @@ def collect_variant_sequences(
         for row in csv.DictReader(handle):
             if row.get("Aligned", "").lower() != "true":
                 continue
-            hgvs_names = set()
+            hgvs_names: dict[str, set[str]] = {}
             for name in row.get("HGVS", "").split(";"):
-                hgvs_names.update(names.get(name, set()))
+                for hgvs in names.get(name, set()):
+                    hgvs_names.setdefault(hgvs, set()).add(name)
             sequence = row["Sequence"].upper()
             for hgvs in hgvs_names:
                 support = variants.setdefault(hgvs, Counter())
@@ -770,6 +799,36 @@ def collect_variant_sequences(
                     count = counts[(sequence, orientation)]
                     if count:
                         support[(sequence, orientation)] += count
+                        if provenance is not None:
+                            sources = provenance.setdefault(hgvs, {}).setdefault(
+                                (sequence, orientation), Counter()
+                            )
+                            assigned_references = {mutant_references[name]
+                                                   for name in hgvs_names[hgvs]}
+                            if len(assigned_references) != 1:
+                                raise ValueError(f"Ambiguous mutant references for {hgvs}")
+                            sources[next(iter(assigned_references))] += count
+
+
+def variant_sequence_records(
+    hgvs: str,
+    support: Counter[tuple[str, str]],
+) -> list[tuple[tuple[str, str], SeqRecord]]:
+    """Build the shared ordered sequence identities for FASTA and TXT exports."""
+    if not support:
+        raise ValueError(f"No supporting sequences found for {hgvs}")
+    ordered = sorted(
+        support.items(),
+        key=lambda item: (item[0][1] == "-", -item[1], item[0][0]),
+    )
+    return [
+        ((sequence, orientation), SeqRecord(
+            Seq(sequence),
+            id=f"sequence{index:03d}_count{count}_orientation{orientation}",
+            description=f"HGVS={hgvs} sequence_orientation=transcript",
+        ))
+        for index, ((sequence, orientation), count) in enumerate(ordered, start=1)
+    ]
 
 
 def write_variant_fastas(
@@ -781,20 +840,46 @@ def write_variant_fastas(
     paths = []
     for number, call in enumerate(calls, start=1):
         support = variants.get(call["HGVS"], Counter())
-        if not support:
-            raise ValueError(f"No supporting sequences found for {call['HGVS']}")
+        records = variant_sequence_records(call["HGVS"], support)
         path = bam_path.parent / f"{_sample_name(bam_path)}_variant{number:03d}.fasta"
-        records = sorted(
-            support.items(),
-            key=lambda item: (item[0][1] == "-", -item[1], item[0][0]),
-        )
         with path.open("w") as handle:
-            for index, ((sequence, orientation), count) in enumerate(records, start=1):
-                handle.write(
-                    f">sequence{index:03d}_count{count}_orientation{orientation} "
-                    f"HGVS={call['HGVS']} sequence_orientation=transcript\n"
-                )
-                handle.write(sequence + "\n")
+            SeqIO.write((record for _, record in records), handle, "fasta-2line")
+        paths.append(path)
+    return paths
+
+
+def write_variant_alignments(
+    bam_path: Path,
+    calls: list[dict[str, str]],
+    variants: dict[str, Counter[tuple[str, str]]],
+    provenance: VariantAmplicons,
+    aligner,
+) -> list[Path]:
+    """Render supporting reads against assigned mutant amplicons with Biopython."""
+    paths = []
+    rendered: dict[tuple[str, str], str] = {}
+    for number, call in enumerate(calls, start=1):
+        hgvs = call["HGVS"]
+        support = variants.get(hgvs, Counter())
+        records = variant_sequence_records(hgvs, support)
+        sources_by_sequence = provenance.get(hgvs, {})
+        for key, record in records:
+            sources = sources_by_sequence.get(key, Counter())
+            if not sources or sum(sources.values()) != support[key]:
+                raise ValueError(f"Incomplete mutant reference provenance for {record.id} ({hgvs})")
+        path = bam_path.parent / f"{_sample_name(bam_path)}_variant{number:03d}_alignments.txt"
+        with path.open("w") as handle:
+            for key, record in records:
+                handle.write(f"{record.id}\n{record.description}\n")
+                for (label, reference), count in sorted(sources_by_sequence[key].items()):
+                    handle.write(f"amplicon={label} assigned_count={count} reference_type=FLT3-ITD\n\n")
+                    cache_key = (key[0], reference)
+                    if cache_key not in rendered:
+                        read = SeqRecord(record.seq, id="read")
+                        ref = SeqRecord(Seq(reference), id="reference")
+                        rendered[cache_key] = str(aligner.align(read, ref)[-1])
+                    handle.write(rendered[cache_key] + "\n")
+                handle.write("\n")
         paths.append(path)
     return paths
 
@@ -986,6 +1071,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--variant-fasta", action="store_true",
         help="export unique supporting sequences per BAM strand beside the BAM",
     )
+    parser.add_argument(
+        "--variant-alignments", action="store_true",
+        help="export supporting-sequence alignments to assigned FLT3-ITD references beside the BAM",
+    )
     return parser.parse_args(argv)
 
 
@@ -1043,6 +1132,8 @@ def main() -> int:
         input_format = detect_input_format(args.input, args.input_format)
         if args.variant_fasta and input_format != "bam":
             raise ValueError("--variant-fasta requires BAM input (original alignment strands)")
+        if args.variant_alignments and input_format != "bam":
+            raise ValueError("--variant-alignments requires BAM input (original alignment strands)")
         reference = Flt3Reference.load(args.flt3_reference)
         target_start0, target_end0 = reference.target_fetch_interval()
         contig = reference.chrom
@@ -1133,6 +1224,7 @@ def main() -> int:
 
         all_calls: list[dict[str, str]] = []
         variant_sequences: dict[str, Counter[tuple[str, str]]] = {}
+        variant_amplicons: VariantAmplicons = {}
         with tempfile.TemporaryDirectory(prefix="itdmapper_") as tmp:
             temp_root = Path(tmp)
             for idx, (amplicon, counts) in enumerate(zip(amplicons, read_groups), start=1):
@@ -1179,12 +1271,18 @@ def main() -> int:
                 )
                 calls = read_calls(filtered, amplicon, contig, reference)
                 all_calls.extend(calls)
-                if args.variant_fasta and calls:
+                if (args.variant_fasta or args.variant_alignments) and calls:
                     collect_variant_sequences(
                         filtered.parent / "alignClasses.csv",
                         calls,
                         strand_sequence_counts(bam_groups[idx - 1], reference.strand),
                         variant_sequences,
+                        provenance=variant_amplicons if args.variant_alignments else None,
+                        mutant_references=read_variant_references(
+                            filtered,
+                            filtered.parent / f"{_sample_name(args.input)}_ampliconome.fa",
+                            f"{contig}:{amplicon.label}",
+                        ) if args.variant_alignments else None,
                     )
 
         if not all_calls:
@@ -1203,6 +1301,18 @@ def main() -> int:
             if args.verbose:
                 for path in paths:
                     print(f"Variant FASTA: {path}", file=sys.stderr)
+
+        if args.variant_alignments:
+            paths = write_variant_alignments(
+                args.input, ranked_calls, variant_sequences, variant_amplicons,
+                _make_aligner(
+                    args.match_score, args.mismatch_score,
+                    args.gap_open_score, args.gap_extend_score,
+                ),
+            )
+            if args.verbose:
+                for path in paths:
+                    print(f"Variant alignments: {path}", file=sys.stderr)
 
         print("HGVS\tnetInsert\tcounts\tvaf_percent\tcoverage\tamplicon")
         for call in ranked_calls:

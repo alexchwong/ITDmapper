@@ -130,6 +130,52 @@ for `NO_FLT3_ITD`. FASTQ input with this flag is rejected because it has no orig
 BAM alignment strand. Reruns overwrite current variant files; older extra numbered
 files are not automatically deleted and should be removed before rerunning if needed.
 
+### Supporting-sequence alignment reports (BAM only)
+
+Add `--variant-alignments` to write a human-readable TXT report for each final
+reported variant. For `/data/sample.bam`, the files are
+`/data/sample_variant001_alignments.txt`, etc. Variant numbering, sequence IDs,
+counts, and sequence ordering match the corresponding FASTA export exactly.
+The flags are independent: use either export alone or combine
+`--variant-fasta --variant-alignments` to generate both.
+
+Each sequence is aligned against its assigned **reconstructed FLT3-ITD amplicon
+reference**, containing the reference sequence plus the assigned insertion or
+duplication (and any deletions specified by that mutation), not the WT amplicon
+or the entire FLT3 reference. References are taken directly from mergeITD's emitted
+amplicon FASTA and matched by raw mutation assignment before HGVS normalization.
+Read and reference are displayed in FLT3/transcript orientation. Original BAM
+strand remains encoded in the sequence ID, so identical sequences supported on
+both strands appear separately, as in FASTA.
+
+```text
+sequence001_count12_orientation+
+HGVS=<reported variant> sequence_orientation=transcript
+amplicon=<chromosome:start-end> assigned_count=12 reference_type=FLT3-ITD
+
+read              0 ACGCAATGTG 10
+                  0 |||||.|||| 10
+reference         0 ACGCAGTGTG 10
+```
+
+Biopython renders the alignment directly, including position numbers and wrapping:
+`|` marks matching bases, `.` marks mismatches, and `-` marks gaps. Displayed
+positions are zero-based sequence offsets. Amplicon labels use 1-based inclusive
+genomic coordinates. When one sequence record combines support from multiple
+amplicons, its aggregate-count header is followed by one alignment subsection per
+contributing amplicon/mutant-reference pair, each with its own `assigned_count`.
+
+Rendering uses the caller's effective match, mismatch, gap-open and gap-extension
+settings, global alignment with free terminal gaps, and the same last-optimal-
+alignment selection. It does not reassign sequences, apply additional acceptance
+filters, or change calls, counts, VAF, or tabular output. Full sequences and terminal
+overhangs are retained. Repeated sequence/reference pairs reuse the same rendering
+within a run.
+
+No reports are written for `NO_FLT3_ITD`. FASTQ input with this flag is rejected
+because it lacks original BAM alignment strands. Reruns overwrite current reports;
+older extra numbered files are not automatically deleted.
+
 ## Settings and quality filters
 
 All runtime thresholds are defined in packaged `config/default.toml`. A custom TOML file can contain only values that need to change. Explicit CLI options override both the custom file and packaged defaults.
@@ -213,5 +259,10 @@ From the repository root:
 `test_fastq_mode.py` covers automatic format detection, per-read FASTQ quality filtering, pre-assignment copy filtering, multiple amplicon discovery, reverse-orientation reads, alignment acceptance/rejection, and failure when discovery candidates do not overlap the FLT3 target.
 
 `test_hgvs_normalization.py` covers 3' shifting, tandem-repeat sequence rotation, insertion-to-duplication classification, normalization beyond inferred amplicon boundaries, intronic coordinate formatting, and normalization idempotence.
+
+`test_variant_alignments.py` covers native Biopython rendering, scoring overrides,
+shared FASTA/TXT ordering and counts, multi-amplicon provenance, rendering reuse,
+and CLI validation. `test_variant_fasta.py` also checks TXT-only and combined
+exports end to end on a synthetic BAM, unchanged calls, and no-call export behavior.
 
 `test_mergeitd_parity.py` continues to check that the extracted mergeITD core remains source-identical to `mergeitd.py`; FASTQ support does not modify the mergeITD core.
